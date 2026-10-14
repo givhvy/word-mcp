@@ -1,0 +1,11 @@
+# Generated on first use from the local Word install (dump_typelib.ps1)
+word-api.json
+WORD_API.md
+
+# Test output (scratch documents, renders)
+test-output/
+
+__pycache__/
+*.pyc
+.venv/
+.claude/
