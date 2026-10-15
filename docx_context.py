@@ -305,6 +305,17 @@ class Context:
         self.lines.append((n, f"{label} {prefix}{text}"))
         return text
 
+    def _unwrapped(self, parent, name):
+        """Rows or cells, including those a content control (w:sdt) wraps - cover pages bind
+        document properties to a cell this way."""
+        for el in parent:
+            if el.tag == W(name):
+                yield el
+            elif el.tag == W("sdt"):
+                c = el.find(W("sdtContent"))
+                if c is not None:
+                    yield from self._unwrapped(c, name)
+
     def _table(self, tbl, nested=False) -> list[list[str]]:
         if not nested:
             self.tables += 1
@@ -312,9 +323,9 @@ class Context:
             self.table_styles.append(ts.get(W("val")) if ts is not None else "TableNormal")
         first = self.para + 1
         rows = []
-        for tr in tbl.findall(W("tr")):
+        for tr in self._unwrapped(tbl, "tr"):
             row = []
-            for tc in tr.findall(W("tc")):
+            for tc in self._unwrapped(tr, "tc"):
                 tcpr = tc.find(W("tcPr"))
                 span = 1
                 vmerge = False

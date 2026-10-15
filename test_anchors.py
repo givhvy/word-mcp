@@ -87,8 +87,10 @@ async def main():
             sections0, images0, comments0 = d.Sections.Count, d.InlineShapes.Count, d.Comments.Count
             # --- numbering: word_read == Word, paragraph by paragraph -----------------------------
             rd = await call(s, "word_read", **D)
+            # a tracked deletion stays in Word's Range.Text but word_read shows the accepted text
             bad = [p["n"] for p in rd["paragraphs"]
-                   if alnum(p["text"]) != alnum(W.text(p["n"])) and alnum(W.text(p["n"])) not in ("",)]
+                   if alnum(p["text"]) != alnum(W.text(p["n"])) and alnum(W.text(p["n"])) not in ("",)
+                   and d.Paragraphs(p["n"]).Range.Revisions.Count == 0]
             check(rd["paragraph_count"] == d.Paragraphs.Count and not bad,
                   f"word_read numbering == Word's for all {d.Paragraphs.Count} paragraphs (mismatches: {bad[:5]})")
             ctx = (await s.call_tool("word_context", D)).content[0].text

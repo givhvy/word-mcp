@@ -372,6 +372,7 @@ text, `in_table`, `row_end`, `heading` level, `list` kind and `abs` (abstractNum
 | "Object has been deleted" in tests | two suites driving the same Word | run suites one at a time (`tests_common.setup()` locks) |
 | `UnicodeEncodeError` printing | cp1252 console | `tests_common.setup()` switches stdout to UTF-8 |
 | `<unknown>.Name` | document mid-save/sync | retried automatically; check `WORD_MCP_LOG` if persistent |
+| `word_read` / `paragraph_map` is 2+ paragraphs short, "safety check failed" on a real document with a cover page | table cells or rows wrapped in a content control (`w:sdt`, e.g. a cover table bound to document properties) were skipped by the parse | `Context._unwrapped()` looks through `w:sdt` for `w:tr`/`w:tc`; pinned by `test_sdt_table.py` (offline). Compare `len(Context(d.WordOpenXML).para_meta)` with `d.Paragraphs.Count` |
 | `word_status` fails on one property | Word refuses it in the current UI state | wrap the read in `safe()` |
 | `No module named 'mcp.server.fastmcp'` | MCP SDK 2.x | `pip install "mcp>=1.10,<2"` |
 | `word_page_image` returns the wrong page | client cached an old schema (`page` vs `pages`) | both are accepted; restart the client |
