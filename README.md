@@ -80,11 +80,13 @@ python -I test_word_mcp.py
 python -I test_context.py
 python -I test_v2.py
 python -I test_styles.py
+python -I test_anchors.py           # anchors, numbering and deletes on a section-break / table-heavy document
 python -I test_concurrent_user.py   # needs cua-driver: simulates a user paging through the document
 ```
 
 Each test creates its own scratch documents in your open Word, checks every tool, and closes only what
-it created. Both should end with `ALL CHECKS PASSED`.
+it created; each should end with `ALL CHECKS PASSED`. Run them **one at a time**: they all drive the same
+Word, so a second suite started in parallel refuses to run. Never point a test at a real document.
 
 ## Guide for agents
 
@@ -123,6 +125,16 @@ The server sends these rules to the agent on connect; they are repeated here.
 3. **Target by text, not just numbers**: `position="section_end", anchor="Components"` appends to a
    section; `position="after", anchor="..."` inserts after any paragraph. When editing by number,
    pass `expect` (the start of the paragraph's text): the edit is refused if the user changed it.
+   Edits are safe by construction:
+   - an anchor must identify **exactly one** paragraph (exact text first, then the start of a paragraph);
+     ambiguous anchors are refused with the candidates listed - nothing is guessed;
+   - table cells and table-of-contents lines are skipped unless `in_tables=true`; `section_end` only
+     matches headings and stays before a section break (page / orientation change);
+   - every target is checked against Word's actual paragraph before the edit; on any disagreement
+     nothing is changed;
+   - inserts report `placed_after` / `placed_before` (the paragraphs around the new content);
+   - deletes and paragraph rewrites refuse to remove pictures, comments, tables or section breaks
+     unless `allow_content_loss=true`, and report exactly what was removed.
 4. **Before the next edit**, `word_changes` lists what the user changed since your last read (added,
    removed and changed paragraphs with current numbers, image/comment counts). It is cheap; the
    agent's own edits are not reported.
@@ -224,6 +236,11 @@ menu makes Word refuse automation (the server retries for 5 s, then reports "Wor
 | `Word is busy: close any open dialog` | A dialog (Save As, Options, a message box) is open in Word. Close it and retry. |
 | `No document is open in Word` | Open or create a document, or call `word_new_document`. |
 | `ModuleNotFoundError: win32com` | `python -m pip install pywin32`. If it still fails: `python -m pywin32_postinstall -install` (as administrator). |
+| `word-mcp needs the MCP Python SDK 1.x` / `No module named 'mcp.server.fastmcp'` | MCP 2.x is installed (it renamed FastMCP). `python -m pip install "mcp>=1.10,<2"` - `requirements.txt` pins this. |
+| `anchor ... is ambiguous` / `no paragraph matches anchor` | The anchor named several paragraphs, or only text inside a table / contents. Use a longer anchor, `in_tables=true`, or `paragraph=N` with `expect`. |
+| `safety check failed` | Word's paragraph did not match what the agent read (the document changed meanwhile). Nothing was changed: re-read with `word_context` and retry. |
+| `Word returned an unusable object` | Word was mid-save or mid-sync (SharePoint); the server retried for 5 s. Retry a moment later. |
+| Diagnosing errors | Set `WORD_MCP_LOG=C:\path\word-mcp.log` in the client's environment for the server: every failed call is logged with its full trace. |
 | A tool times out | `WORD_MCP_TIMEOUT` (seconds, default 120) sets the limit. A long PDF export of a big document can take a while. |
 | `word_open` closed an empty document | Word's own File > Open replaces a lone, untouched blank document. The tool reports it as `replaced_blank_document`. |
 | Clients start the wrong Python | Put the full path to `python.exe` in the client config. |

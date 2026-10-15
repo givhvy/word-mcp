@@ -22,6 +22,9 @@ import win32com.client
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I leaves this folder off sys.path
+import tests_common  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "test-output")
 SECTIONS = 30
@@ -146,6 +149,7 @@ def verify(s_texts: list[str], label: str):
 
 
 async def main():
+    tests_common.setup()
     os.makedirs(OUT, exist_ok=True)
     pid = word_pid()
     pythoncom.CoInitialize()

@@ -17,16 +17,29 @@ import queue
 import re
 import sys
 import threading
+import logging
 import time
+import traceback
 from typing import Any, Callable
 
 import pythoncom
 import pywintypes
 import win32com.client
-from mcp.server.fastmcp import FastMCP, Image
+try:
+    from mcp.server.fastmcp import FastMCP, Image
+except ModuleNotFoundError as _e:  # MCP 2.x renamed FastMCP; this server targets the 1.x API
+    raise SystemExit("word-mcp needs the MCP Python SDK 1.x: run  python -m pip install \"mcp>=1.10,<2\"  "
+                     f"(installed: {_e})") from None
 from PIL import Image as PILImage
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+log = logging.getLogger("word-mcp")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s word-mcp %(levelname)s %(message)s")
+if os.environ.get("WORD_MCP_LOG"):  # full error traces to a file
+    _fh = logging.FileHandler(os.environ["WORD_MCP_LOG"], encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log.addHandler(_fh)
+    log.setLevel(logging.DEBUG)
 sys.path.insert(0, HERE)  # launched with python -I, which leaves the script folder off sys.path
 from docx_context import Context  # noqa: E402
 
@@ -67,6 +80,15 @@ CM_TO_PT = 72.0 / 2.54
 
 class WordError(Exception):
     pass
+
+
+def safe(fn: Callable[[], Any], default: Any = None) -> Any:
+    """Read a Word property that Word may refuse in some UI states (e.g. TrackRevisions while a
+    comment card is selected); returns default instead of failing the whole tool."""
+    try:
+        return fn()
+    except (pywintypes.com_error, AttributeError):
+        return default
 
 
 def com_message(e: pywintypes.com_error) -> str:
@@ -113,9 +135,21 @@ class ComWorker:
     def _call(self, fn: Callable[[Any], Any]):
         deadline = time.monotonic() + 5.0
         reconnected = False
+        tool = fn.__qualname__.split(".")[0]
         while True:
             try:
                 return fn(self.app())
+            except AttributeError as e:
+                # pywin32 raises AttributeError("<unknown>.Name") when Word hands back an object it
+                # cannot describe yet (document mid-save / mid-sync). Transient: retry, then explain.
+                if "<unknown>" not in str(e):
+                    raise
+                if time.monotonic() < deadline:
+                    time.sleep(0.2)
+                    continue
+                log.warning("%s: %s\n%s", tool, e, traceback.format_exc())
+                raise WordError(f"Word returned an unusable object ({e}) - the document may be busy "
+                                "saving or syncing; retry in a moment") from None
             except pywintypes.com_error as e:
                 hr = e.args[0]
                 if hr in (RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER) and time.monotonic() < deadline:
@@ -124,6 +158,7 @@ class ComWorker:
                 if hr in (RPC_E_DISCONNECTED, RPC_S_SERVER_UNAVAILABLE, CO_E_OBJNOTCONNECTED) and not reconnected:
                     self._app, reconnected = None, True  # Word was restarted
                     continue
+                log.warning("%s: %s\n%s", tool, com_message(e), traceback.format_exc())
                 if hr in (RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER):
                     raise WordError("Word is busy: close any open dialog in Word and retry") from None
                 raise WordError(com_message(e)) from None
@@ -322,12 +357,52 @@ STYLES_READY: set[str] = set()    # documents whose built-in styles were instant
 EDITS = [0]                       # bumps on every agent edit (part of the context fingerprint)
 
 
-def paragraph_texts(d) -> list[str]:
-    """Every paragraph's plain text from one Content.Text read (table cells count, as in Word)."""
+def split_texts(d) -> list[str]:
+    """Paragraph texts from one Content.Text read. Cheap, but NOT Word's numbering: a paragraph that
+    ends with a section break is merged with the next one. Only used for word_changes baselines;
+    paragraph numbers always come from paragraph_map()."""
     parts = d.Content.Text.split("\r")
     if parts and parts[-1] == "":
         parts.pop()
     return [clean(p).strip() for p in parts]
+
+
+def _walk_paragraphs(d) -> list[dict]:
+    """Word's own paragraphs, one COM round trip each (slow; only when the XML parse disagrees)."""
+    out, n = [], 0
+    p = d.Paragraphs(1) if d.Paragraphs.Count else None
+    while p is not None:
+        n += 1
+        r = p.Range
+        raw = r.Text
+        lvl = safe(lambda: p.OutlineLevel, 10)
+        out.append({"n": n, "plain": clean(raw).strip(), "style": safe(lambda: p.Style.NameLocal, "") or "",
+                    "in_table": bool(safe(lambda: r.Information(12), False)),  # wdWithInTable
+                    "heading": lvl if lvl and lvl < 10 else None, "image": safe(lambda: r.InlineShapes.Count, 0) > 0,
+                    "hidden": False, "section_break": raw.endswith("\x0c"), "row_end": raw == "\r\x07"})
+        p = p.Next()
+    return out
+
+
+def paragraph_map(d) -> list[dict]:
+    """One entry per Word paragraph, numbered exactly like Word (n = index into d.Paragraphs).
+    Built from the cached WordOpenXML parse, which counts table cells, end-of-row marks and
+    section-break paragraphs the way Word does; falls back to walking Word's paragraphs if the
+    parse ever disagrees with Word's count."""
+    ctx = get_context(d)
+    if len(ctx.para_meta) == d.Paragraphs.Count:
+        return ctx.para_meta
+    walked = getattr(ctx, "_walked", None)
+    if walked is None:
+        log.warning("paragraph map: XML parse has %d paragraphs, Word %d; walking Word's paragraphs",
+                    len(ctx.para_meta), d.Paragraphs.Count)
+        walked = ctx._walked = _walk_paragraphs(d)
+    return walked
+
+
+def paragraph_texts(d) -> list[str]:
+    """Every paragraph's text in Word's numbering (index 0 = paragraph 1)."""
+    return [clean(m["plain"]).strip() for m in paragraph_map(d)]
 
 
 def doc_counts(d) -> dict:
@@ -336,7 +411,7 @@ def doc_counts(d) -> dict:
 
 
 def take_snapshot(d, texts: list[str] | None = None) -> None:
-    SNAPSHOTS[d.FullName] = {"texts": texts if texts is not None else paragraph_texts(d), "counts": doc_counts(d)}
+    SNAPSHOTS[d.FullName] = {"texts": texts if texts is not None else split_texts(d), "counts": doc_counts(d)}
 
 
 def after_agent_edit(w: "ComWorker") -> None:
@@ -373,43 +448,124 @@ def _norm(t: str) -> str:
     return re.sub(r"\s+", " ", t.strip().lstrip("#").strip()).lower()
 
 
-def locate(d, paragraph: int | None = None, anchor: str = "", expect: str = "",
-           texts: list[str] | None = None) -> int:
-    """Paragraph number from a number or an anchor text (a heading or any paragraph), checking
-    `expect` so an edit never lands on a paragraph that changed since the agent read it."""
-    texts = texts if texts is not None else paragraph_texts(d)
+def _alnum(t: str) -> str:
+    return re.sub(r"[\W_]+", "", t.lower())
+
+
+def _is_heading(m: dict) -> bool:
+    return bool(m.get("heading")) or (m.get("style") or "").lower() == "title"
+
+
+def _heading_level(m: dict) -> int:
+    return 0 if (m.get("style") or "").lower() == "title" else int(m.get("heading") or 99)
+
+
+def _describe(m: dict) -> str:
+    where = ", in a table" if m.get("in_table") else ""
+    return f"p{m['n']} ({m.get('style') or 'Normal'}{where}): {clean(m['plain']).strip()[:60]!r}"
+
+
+def verify_paragraph(d, n: int, m: dict) -> None:
+    """Safety check before an edit: Word's paragraph n must be the paragraph the map describes.
+    On any disagreement nothing is changed and the cached parse is dropped."""
+    word_text = clean(d.Paragraphs(n).Range.Text)
+    if _alnum(word_text) == _alnum(m["plain"]) or (m.get("hidden") and not _alnum(word_text)):
+        return
+    CTX_CACHE.pop(d.FullName, None)
+    raise WordError(f"safety check failed: Word's paragraph {n} reads {word_text.strip()[:70]!r} but the "
+                    f"document map expected {clean(m['plain']).strip()[:70]!r}. Nothing was changed. "
+                    "Re-read with word_context and retry.")
+
+
+def locate(d, paragraph: int | None = None, anchor: str = "", expect: str = "", role: str = "any",
+           in_tables: bool = False, pmap: list[dict] | None = None) -> int:
+    """Word paragraph number from a number or an anchor text, verified against Word before use.
+    An anchor must identify exactly ONE paragraph (exact text first, then prefix, then substring);
+    table cells and table-of-contents lines are skipped unless in_tables=True; role="heading" only
+    considers headings. Ambiguous or missing anchors are refused with the candidates listed.
+    `expect` refuses the edit if the paragraph's current text does not start with it."""
+    pm = pmap if pmap is not None else paragraph_map(d)
     if anchor:
         want = _norm(anchor)
-        hits = [i + 1 for i, t in enumerate(texts) if _norm(t) == want]
-        hits = hits or [i + 1 for i, t in enumerate(texts) if _norm(t).startswith(want)]
-        hits = hits or [i + 1 for i, t in enumerate(texts) if want in _norm(t)]
-        if not hits:
-            raise WordError(f"no paragraph matches anchor {anchor!r}; re-read with word_context")
-        n = hits[0]
+
+        def eligible(m):
+            if m.get("row_end"):
+                return False
+            if role == "heading":
+                return _is_heading(m)
+            if m.get("in_table") and not in_tables:
+                return False
+            return not (m.get("style") or "").lower().startswith("toc")
+
+        cands = [m for m in pm if eligible(m)]
+        n = None
+        # A substring match is only a fallback for an anchor that does not name any paragraph: if the
+        # text is exactly (or the start of) a table cell / contents line, never pick a different paragraph
+        # that merely contains the words.
+        named_elsewhere = any(not eligible(m) and not m.get("row_end")
+                              and _norm(clean(m["plain"])).startswith(want) for m in pm)
+        tests = [lambda t: t == want, lambda t: t.startswith(want)]
+        if not named_elsewhere:
+            tests.append(lambda t: want in t)
+        for test in tests:
+            hits = [m for m in cands if test(_norm(clean(m["plain"])))]
+            if len(hits) == 1:
+                n = hits[0]["n"]
+                break
+            if len(hits) > 1:
+                raise WordError(f"anchor {anchor!r} is ambiguous - {len(hits)} paragraphs match: "
+                                + "; ".join(_describe(m) for m in hits[:6])
+                                + ". Use a longer anchor, or paragraph=N with expect.")
+        if n is None:
+            elsewhere = [m for m in pm if not eligible(m) and not m.get("row_end")
+                         and want in _norm(clean(m["plain"]))]
+            hint = ""
+            if elsewhere:
+                hint = (" It only appears in " + "; ".join(_describe(m) for m in elsewhere[:4])
+                        + (" - section_end needs a heading." if role == "heading" else
+                           " - pass in_tables=true to target table text, or use paragraph=N with expect."))
+            raise WordError(f"no {'heading' if role == 'heading' else 'paragraph'} matches anchor "
+                            f"{anchor!r}.{hint} Re-read with word_context.")
     elif paragraph:
         n = paragraph
-        if not 1 <= n <= len(texts):
-            raise WordError(f"paragraph {n} is out of range (document has {len(texts)})")
+        if not 1 <= n <= len(pm):
+            raise WordError(f"paragraph {n} is out of range (document has {len(pm)})")
+        if role == "heading" and not _is_heading(pm[n - 1]):
+            raise WordError(f"paragraph {n} is not a heading ({_describe(pm[n - 1])}); section_end needs a heading")
     else:
         raise WordError("give paragraph or anchor")
-    if expect and not _norm(texts[n - 1]).startswith(_norm(expect)):
-        raise WordError(f"paragraph {n} now reads {texts[n - 1][:80]!r}, not {expect!r}: the document changed "
-                        "since you read it. Re-read (word_changes / word_context) or target it by anchor.")
+    m = pm[n - 1]
+    if expect and not _norm(clean(m["plain"])).startswith(_norm(expect)):
+        raise WordError(f"paragraph {n} reads {clean(m['plain']).strip()[:80]!r}, not {expect!r}: the document "
+                        "changed since you read it. Re-read (word_changes / word_context) or target it by anchor.")
+    verify_paragraph(d, n, m)
     return n
 
 
-def section_end(d, n: int) -> int | None:
-    """Paragraph number where the section started by heading n ends (next heading of the same or a
-    higher level), or None when it runs to the end of the document."""
-    levels = get_context(d).heading_level
-    if n not in levels:
-        raise WordError(f"paragraph {n} is not a heading; section_end needs a heading anchor")
-    lvl = levels[n]
-    nxt = [m for m, l in levels.items() if m > n and l <= lvl]
-    return min(nxt) if nxt else None
+def section_end(d, n: int, pmap: list[dict] | None = None) -> int | None:
+    """Paragraph number to insert BEFORE so that content ends the section started by heading n: the
+    next heading of the same or a higher level, moved back over empty section-break paragraphs so the
+    content stays on the section's own pages. None when the section runs to the end of the document."""
+    pm = pmap if pmap is not None else paragraph_map(d)
+    lvl = _heading_level(pm[n - 1])
+    nxt = next((m["n"] for m in pm[n:] if _is_heading(m) and not m.get("in_table") and _heading_level(m) <= lvl), None)
+    if nxt is None:
+        return None
+    # Walk back over the empty paragraphs before the next heading; if a section break is among them,
+    # stop before it so the content stays on this section's pages (not after a page/orientation change).
+    k = nxt - 1
+    while k > n:
+        m = pm[k - 1]
+        if _alnum(m["plain"]) or m.get("image") or m.get("in_table") or m.get("row_end"):
+            break
+        if m.get("section_break"):
+            return k
+        k -= 1
+    return nxt
 
 
-def new_paragraph_at(d, app, position: str, paragraph: int = 0, anchor: str = "", expect: str = "") -> int:
+def new_paragraph_at(d, app, position: str, paragraph: int = 0, anchor: str = "", expect: str = "",
+                     in_tables: bool = False) -> int:
     """Create one empty Normal paragraph at the requested place and return its start position.
     position: end | start | after | before | section_end (anchor = heading) | cursor (after the
     paragraph holding the cursor)."""
@@ -419,20 +575,25 @@ def new_paragraph_at(d, app, position: str, paragraph: int = 0, anchor: str = ""
         d.Range(0, 0).InsertBefore("\r")
         pos = 0
     elif position == "cursor":
-        p = para_index(d, app.Selection.Start)
-        return new_paragraph_at(d, app, "after", p)
+        return new_paragraph_at(d, app, "after", para_index(d, app.Selection.Start), in_tables=True)
     elif position in ("after", "before", "section_end"):
-        texts = paragraph_texts(d)
-        n = locate(d, paragraph or None, anchor, expect, texts)
+        pm = paragraph_map(d)
+        n = locate(d, paragraph or None, anchor, expect, "heading" if position == "section_end" else "any",
+                   in_tables, pm)
         if position == "section_end":
-            end = section_end(d, n)
-            if end is None:
+            stop = section_end(d, n, pm)
+            if stop is None:
                 return new_paragraph_at(d, app, "end")
-            return new_paragraph_at(d, app, "before", end)
-        if position == "after" and n == len(texts):
-            pos, _ = _append(d, "")
+            verify_paragraph(d, stop, pm[stop - 1])
+            position, n = "before", stop
+        if position == "after":
+            # Split at the end of paragraph n itself: the new paragraph can never land inside a
+            # table (or section) that follows it.
+            mark = d.Paragraphs(n).Range.End - 1
+            d.Range(mark, mark).InsertAfter("\r")
+            pos = mark + 1
         else:
-            pos = d.Paragraphs(n + 1 if position == "after" else n).Range.Start
+            pos = d.Paragraphs(n).Range.Start
             d.Range(pos, pos).InsertBefore("\r")
     else:
         raise WordError("position must be end, start, after, before, section_end or cursor")
@@ -522,13 +683,15 @@ async def word_status() -> dict:
         out = {"version": app.Version, "build": app.Build, "documents": docs}
         if docs:
             d = app.ActiveDocument
-            s = app.Selection
+            # Each property on its own: Word refuses some in certain UI states (e.g. TrackRevisions
+            # while a comment card is selected) and that must not fail the whole status.
+            sel = safe(lambda: app.Selection)
             out["active"] = {
-                "name": d.Name, "path": d.FullName, "paragraphs": d.Paragraphs.Count,
-                "characters": d.Characters.Count, "tables": d.Tables.Count,
-                "comments": d.Comments.Count, "revisions": d.Revisions.Count,
-                "track_changes": bool(d.TrackRevisions),
-                "selection": {"start": s.Start, "end": s.End, "text": clean(s.Text)[:200]},
+                "name": d.Name, "path": d.FullName, "paragraphs": safe(lambda: d.Paragraphs.Count),
+                "characters": safe(lambda: d.Characters.Count), "tables": safe(lambda: d.Tables.Count),
+                "comments": safe(lambda: d.Comments.Count), "revisions": safe(lambda: d.Revisions.Count),
+                "track_changes": safe(lambda: bool(d.TrackRevisions)),
+                "selection": safe(lambda: {"start": sel.Start, "end": sel.End, "text": clean(sel.Text)[:200]}),
             }
         return out
     return await worker.run(fn)
@@ -634,31 +797,25 @@ async def word_activate(document: str) -> dict:
 @mcp.tool()
 async def word_read(start_paragraph: int = 1, end_paragraph: int = 0, with_styles: bool = False,
                     document: str = "") -> dict:
-    """Read paragraphs as [{n, text}] (1-based). end_paragraph=0 reads to the end.
-    with_styles adds each paragraph's style name (one extra Word call per paragraph)."""
+    """Read paragraphs as [{n, text}] (1-based, Word's own numbering - the same numbers paragraph=,
+    anchors and word_context use). end_paragraph=0 reads to the end. with_styles adds each
+    paragraph's style and whether it sits in a table."""
     def fn(app):
         d = get_doc(app, document)
-        count = d.Paragraphs.Count
+        pm = paragraph_map(d)
+        count = len(pm)
         last = count if end_paragraph <= 0 else min(end_paragraph, count)
         first = max(1, start_paragraph)
-        if first > last:
-            return {"paragraph_count": count, "paragraphs": []}
         if first == 1 and last == count:
-            raw = d.Content.Text
             take_snapshot(d)  # a full read is a word_changes baseline too
-        else:
-            raw = d.Range(d.Paragraphs(first).Range.Start, d.Paragraphs(last).Range.End).Text
-        parts = raw.split("\r")
-        if parts and parts[-1] == "":
-            parts.pop()
         paras = []
-        for i, t in enumerate(parts):
-            item = {"n": first + i, "text": clean(t)}
+        for m in pm[first - 1:last]:  # end-of-row marks are paragraphs in Word too (empty text)
+            item = {"n": m["n"], "text": clean(m["plain"]).strip()}
+            if with_styles:
+                item["style"] = m.get("style") or "Normal"
+                if m.get("in_table"):
+                    item["in_table"] = True
             paras.append(item)
-        if with_styles:
-            for item in paras:
-                if item["n"] <= count:
-                    item["style"] = d.Paragraphs(item["n"]).Style.NameLocal
         return {"paragraph_count": count, "paragraphs": paras}
     return await worker.run(fn)
 
@@ -673,13 +830,15 @@ async def word_get_text(document: str = "") -> str:
 
 @mcp.tool()
 async def word_insert(text: str, position: str = "end", paragraph: int = 0, anchor: str = "", expect: str = "",
-                      style: str = "", document: str = "") -> dict:
+                      style: str = "", in_tables: bool = False, document: str = "") -> dict:
     """Insert plain text; newlines make new paragraphs. For formatted content (headings, lists, code,
     tables, images) use word_insert_markdown instead: one call for a whole section.
     position: "end" | "start" | "after" / "before" (paragraph N or `anchor`) | "section_end" (end of the
     section under heading `anchor`) | "cursor" (typed at the selection, inline).
-    anchor: text of the target paragraph (e.g. a heading) - robust when the user edits the document too.
+    anchor: text of exactly one paragraph (e.g. a heading); ambiguous anchors are refused with the
+    candidates listed. Table cells and contents lines are skipped unless in_tables=true.
     expect: start of paragraph N's current text; the edit is refused if it no longer matches.
+    Every target is checked against Word before editing; the result says what the new text sits between.
     style applies a paragraph style ("Heading 1", "List Bullet", ...); without it new paragraphs take the
     document's own body text style (house style, see word_styles)."""
     def fn(app):
@@ -693,16 +852,28 @@ async def word_insert(text: str, position: str = "end", paragraph: int = 0, anch
                 app.Selection.SetRange(b, b)
             else:
                 house_body = None if style else get_context(d).house_style().get("body", {}).get("name")
-                a = new_paragraph_at(d, app, position, paragraph, anchor, expect)
+                a = new_paragraph_at(d, app, position, paragraph, anchor, expect, in_tables)
                 d.Range(a, a).InsertAfter(body)
                 b = a + len(body)
                 if style:
                     d.Range(a, b).Style = resolve_style(d, style)
                 elif house_body and house_body != "Normal":  # the document's own body text style
                     d.Range(a, b).Style = d.Styles(house_body)
-        return {"first_paragraph": para_index(d, a), "last_paragraph": para_index(d, b),
-                "paragraph_count": d.Paragraphs.Count}
+        first, last = para_index(d, a), para_index(d, b)
+        return {"first_paragraph": first, "last_paragraph": last, "paragraph_count": d.Paragraphs.Count,
+                **neighbours(d, first, last)}
     return await worker.run(fn, edit=True)
+
+
+def neighbours(d, first: int, last: int) -> dict:
+    """Where inserted content landed: the paragraphs right before and after it, read from Word."""
+    def text(k):
+        if not 1 <= k <= d.Paragraphs.Count:
+            return None
+        r = d.Paragraphs(k).Range
+        t = clean(r.Text).strip()
+        return (t[:80] or ("[image]" if r.InlineShapes.Count else "[empty]")) + (" (table)" if safe(lambda: r.Information(12)) else "")
+    return {"placed_after": text(first - 1), "placed_before": text(last + 1)}
 
 
 def _append(d, body: str) -> tuple[int, int]:
@@ -717,32 +888,58 @@ def _append(d, body: str) -> tuple[int, int]:
 
 @mcp.tool()
 async def word_set_paragraph(text: str, paragraph: int = 0, anchor: str = "", expect: str = "",
-                             document: str = "") -> dict:
+                             in_tables: bool = False, allow_content_loss: bool = False, document: str = "") -> dict:
     """Replace one paragraph's text (by number or `anchor` text), keeping its style and formatting.
-    expect: start of the paragraph's current text; refused if the document changed."""
+    expect: start of the paragraph's current text; refused if the document changed.
+    Refused when the paragraph holds pictures or comments (they would be lost) unless allow_content_loss."""
     def fn(app):
         d = get_doc(app, document)
-        n = locate(d, paragraph or None, anchor, expect)
+        n = locate(d, paragraph or None, anchor, expect, in_tables=in_tables)
         r = d.Paragraphs(n).Range
+        body = d.Range(r.Start, r.End - 1)
+        held = {"images": body.InlineShapes.Count, "comments": body.Comments.Count}
+        if (held["images"] or held["comments"]) and not allow_content_loss:
+            raise WordError(f"paragraph {n} holds {held['images']} picture(s) and {held['comments']} comment(s) that "
+                            "replacing its text would remove. Use word_replace for the words, or pass "
+                            "allow_content_loss=true.")
         with undo_step(app, "set paragraph"):
-            d.Range(r.Start, r.End - 1).Text = to_word(text)
+            body.Text = to_word(text)
         return {"paragraph": n, "paragraph_count": d.Paragraphs.Count}
     return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
 async def word_delete_paragraphs(start_paragraph: int = 0, end_paragraph: int = 0, anchor: str = "",
-                                 expect: str = "", document: str = "") -> dict:
+                                 expect: str = "", in_tables: bool = False, allow_content_loss: bool = False,
+                                 document: str = "") -> dict:
     """Delete paragraphs start..end (inclusive; end defaults to start). `anchor` picks the start paragraph
-    by its text; `expect` refuses the delete if the start paragraph no longer reads like that."""
+    by its text (it must match exactly one paragraph); `expect` refuses the delete if the start paragraph
+    no longer reads like that. Both ends are checked against Word first. Refused when the range holds
+    pictures, comments or tables, or cuts into a table, unless allow_content_loss=true. Returns exactly
+    what was removed. A repeat call whose anchor is already gone fails with "no paragraph matches"."""
     def fn(app):
         d = get_doc(app, document)
-        first = locate(d, start_paragraph or None, anchor, expect)
+        pm = paragraph_map(d)
+        first = locate(d, start_paragraph or None, anchor, expect, in_tables=in_tables, pmap=pm)
         last = max(first, end_paragraph or first)
-        check_para(d, last)
+        if last > len(pm):
+            raise WordError(f"paragraph {last} is out of range (document has {len(pm)})")
+        verify_paragraph(d, last, pm[last - 1])
+        rng = d.Range(d.Paragraphs(first).Range.Start, d.Paragraphs(last).Range.End)
+        held = {"images": rng.InlineShapes.Count, "comments": rng.Comments.Count, "tables": rng.Tables.Count,
+                "section_breaks": sum(bool(m.get("section_break")) for m in pm[first - 1:last])}
+        touches_table = any(m.get("in_table") for m in pm[first - 1:last])
+        if (any(held.values()) or touches_table) and not allow_content_loss:
+            raise WordError(f"deleting paragraphs {first}-{last} would also remove {held['images']} picture(s), "
+                            f"{held['comments']} comment(s), {held['tables']} table(s) and "
+                            f"{held['section_breaks']} section break(s)"
+                            + (" and cut into a table" if touches_table else "")
+                            + ". Nothing was deleted. Narrow the range, or pass allow_content_loss=true.")
+        removed = [clean(m["plain"]).strip()[:80] for m in pm[first - 1:last]]
         with undo_step(app, "delete paragraphs", freeze=last - first > 20):
-            d.Range(d.Paragraphs(first).Range.Start, d.Paragraphs(last).Range.End).Delete()
-        return {"deleted": last - first + 1, "paragraph_count": d.Paragraphs.Count}
+            rng.Delete()
+        return {"deleted": last - first + 1, "removed": removed[:20], "removed_content": held,
+                "paragraph_count": d.Paragraphs.Count}
     return await worker.run(fn, edit=True)
 
 
@@ -1101,14 +1298,14 @@ async def word_context(start_paragraph: int = 1, max_chars: int = 60000, include
     def fn(app):
         d = get_doc(app, document)
         ctx = get_context(d, refresh)
-        sel = app.Selection
-        same_doc = app.ActiveDocument.FullName == d.FullName
+        sel = safe(lambda: app.Selection)
+        same_doc = safe(lambda: app.ActiveDocument.FullName == d.FullName, False)
         info = {
-            "pages": d.ComputeStatistics(2) if stats else None,
-            "words": d.ComputeStatistics(0) if stats else None,
+            "pages": safe(lambda: d.ComputeStatistics(2)) if stats else None,
+            "words": safe(lambda: d.ComputeStatistics(0)) if stats else None,
             "paragraphs": d.Paragraphs.Count, "saved": bool(d.Saved), "autosave": autosave_state(d),
-            "track_changes": bool(d.TrackRevisions),
-            "cursor": (para_index(d, sel.Start), clean(sel.Text).strip()[:200]) if same_doc else None,
+            "track_changes": safe(lambda: bool(d.TrackRevisions)),
+            "cursor": safe(lambda: (para_index(d, sel.Start), clean(sel.Text).strip()[:200])) if same_doc and sel else None,
         }
         take_snapshot(d)
         images = []
@@ -1199,13 +1396,26 @@ async def word_changes(document: str = "") -> dict:
     The call also becomes the new baseline."""
     def fn(app):
         d = get_doc(app, document)
-        now = paragraph_texts(d)
+        now = split_texts(d)  # cheap and comparable with the stored baselines
         counts = doc_counts(d)
         base = SNAPSHOTS.get(d.FullName)
         take_snapshot(d, now)
         if base is None:
             return {"baseline": "none yet - call word_context to read the document first; baseline taken now",
-                    "paragraph_count": len(now)}
+                    "paragraph_count": d.Paragraphs.Count}
+        if base["texts"] == now and base["counts"] == counts:
+            return {"changed": False, "paragraph_count": d.Paragraphs.Count, "changes": [], "counts": {}}
+        # Translate positions in the Content.Text split (where a section-break paragraph is merged with
+        # the next one) into Word's paragraph numbers.
+        pm = paragraph_map(d)
+        word_no, i = [], 0
+        while i < len(pm):
+            word_no.append(pm[i]["n"])
+            while pm[i].get("section_break") and i + 1 < len(pm):
+                i += 1
+            i += 1
+        aligned = len(word_no) == len(now)
+        num = lambda j: word_no[j] if aligned and j < len(word_no) else None  # noqa: E731
         import difflib
         out = []
         sm = difflib.SequenceMatcher(None, base["texts"], now, autojunk=False)
@@ -1214,10 +1424,11 @@ async def word_changes(document: str = "") -> dict:
                 continue
             item = {"type": {"replace": "changed", "insert": "added", "delete": "removed"}[op]}
             if j2 > j1:
-                item["paragraphs"] = f"{j1 + 1}" if j2 - j1 == 1 else f"{j1 + 1}-{j2}"
+                a, b = num(j1), num(j2 - 1)
+                item["paragraphs"] = None if a is None else (f"{a}" if a == b else f"{a}-{b}")
                 item["now"] = [t[:300] for t in now[j1:j2][:20]]
             else:
-                item["after_paragraph"] = j1
+                item["after_paragraph"] = num(j1 - 1) if j1 else 0
             if i2 > i1:
                 item["before"] = [t[:300] for t in base["texts"][i1:i2][:20]]
             out.append(item)
@@ -1225,15 +1436,18 @@ async def word_changes(document: str = "") -> dict:
                 out.append({"type": "truncated", "note": "many changes - re-read with word_context"})
                 break
         delta = {k: {"before": base["counts"][k], "now": v} for k, v in counts.items() if base["counts"].get(k) != v}
-        return {"changed": bool(out or delta), "paragraph_count": len(now), "changes": out, "counts": delta,
-                "note": "paragraph numbers are current; formatting-only edits are not listed"}
+        note = "paragraph numbers are Word's current numbers; formatting-only edits are not listed"
+        if not aligned:
+            note = "paragraph numbers unavailable for this layout - re-read with word_context before editing by number"
+        return {"changed": bool(out or delta), "paragraph_count": len(pm), "changes": out, "counts": delta, "note": note}
     return await worker.run(fn)
 
 
 @mcp.tool()
 async def word_insert_markdown(markdown: str, position: str = "end", paragraph: int = 0, anchor: str = "",
                                expect: str = "", base_dir: str = "", styles: str = "auto",
-                               style_overrides: dict | None = None, document: str = "") -> dict:
+                               style_overrides: dict | None = None, in_tables: bool = False,
+                               document: str = "") -> dict:
     """FASTEST way to write: a whole section (or document) of markdown in ONE call, typed straight into the
     open document with its own styles. Supports # headings, paragraphs, **bold**, *italic*, ~~strike~~,
     `inline code`, [links](https://...), - bullet / 1. numbered lists (nested; each list restarts at 1),
@@ -1243,6 +1457,10 @@ async def word_insert_markdown(markdown: str, position: str = "end", paragraph: 
     Images wider than the page are fitted to the text width.
     position: "end" | "start" | "after" / "before" (paragraph N or `anchor` text) | "section_end"
     (end of the section under heading `anchor`) | "cursor" (after the paragraph holding the cursor).
+    anchor must identify exactly one paragraph (section_end: one heading); ambiguous anchors are refused
+    with the candidates listed; table cells and contents lines are skipped unless in_tables=true. Every
+    target is checked against Word first, and the result's placed_after / placed_before show where the
+    content actually landed.
     styles "auto" (default) follows the document's HOUSE STYLE: its own heading, body, list, table,
     table-text, code, quote, caption and figure styles and its list formats, as listed by word_styles
     (company templates included). "builtin" uses Word's standard styles. style_overrides pins roles to
@@ -1255,7 +1473,7 @@ async def word_insert_markdown(markdown: str, position: str = "end", paragraph: 
         house = house_for(d, styles, style_overrides)
         with undo_step(app, "insert markdown", freeze=True):
             prepare_styles(d)
-            pos = new_paragraph_at(d, app, position, paragraph, anchor, expect)
+            pos = new_paragraph_at(d, app, position, paragraph, anchor, expect, in_tables)
             frag = md_to_word.build(markdown, base_dir or os.getcwd(), usable_width_cm(d, pos), house)
             end_before = d.Content.End
             d.Range(pos, pos).InsertXML(frag.xml)
@@ -1279,7 +1497,8 @@ async def word_insert_markdown(markdown: str, position: str = "end", paragraph: 
                 d.Range(pos, pos + (d.Content.End - end_before)).Fields.Update()
             end = pos + (d.Content.End - end_before)
         used = {r: house[r]["name"] for r in ("heading1", "body", "bullet", "table", "code") if isinstance(house.get(r), dict)}
-        return {"first_paragraph": para_index(d, pos), "last_paragraph": para_index(d, max(pos, end - 1)),
+        first, last = para_index(d, pos), para_index(d, max(pos, end - 1))
+        return {"first_paragraph": first, "last_paragraph": last, **neighbours(d, first, last),
                 "paragraph_count": d.Paragraphs.Count, "headings": frag.headings, "tables": frag.tables,
                 "images": frag.images, "captions": frag.captions, "warnings": frag.warnings,
                 "house_style": used, "ms": round((time.perf_counter() - t0) * 1000)}
@@ -1295,21 +1514,36 @@ async def word_replace_section(anchor: str, markdown: str, keep_heading: bool = 
     the markdown with the new heading). Sub-sections are part of the section and are replaced as well."""
     def fn(app):
         d = get_doc(app, document)
-        texts = paragraph_texts(d)
-        n = locate(d, None, anchor, "", texts)
-        end = section_end(d, n)
-        last = (end - 1) if end else len(texts)
+        pm = paragraph_map(d)
+        n = locate(d, None, anchor, "", role="heading", pmap=pm)  # exactly one heading, verified
+        end = section_end(d, n, pm)  # next heading, kept before any section break
+        last = (end - 1) if end else len(pm)
         first = n + 1 if keep_heading else n
-        removed = 0
+        removed, held = 0, {}
+        # Never delete a section break (page / orientation change): the rewrite stops right before the
+        # first one, which is kept together with whatever follows it.
+        kept = None
+        breaks = [m["n"] for m in pm[first - 1:last] if m.get("section_break")]
+        if breaks:
+            kept = {"stopped_at_section_break": breaks[0],
+                    "kept_paragraphs_after_it": [clean(m["plain"]).strip()[:60] for m in pm[breaks[0]:last]
+                                                 if _alnum(m["plain"])][:10]}
+            last, end = breaks[0] - 1, breaks[0]
         with undo_step(app, "replace section", freeze=True):
             if last >= first:
+                verify_paragraph(d, last, pm[last - 1])
                 # Whole paragraphs; at the document end Word keeps one empty final paragraph,
                 # which the markdown then fills.
-                d.Range(d.Paragraphs(first).Range.Start, d.Paragraphs(last).Range.End).Delete()
+                rng = d.Range(d.Paragraphs(first).Range.Start, d.Paragraphs(last).Range.End)
+                held = {"images": rng.InlineShapes.Count, "comments": rng.Comments.Count, "tables": rng.Tables.Count}
+                rng.Delete()
                 removed = last - first + 1
         # where the new content goes: before the next section's heading, or at the end
-        return {"heading_paragraph": n, "removed_paragraphs": removed,
-                "insert": ("before", first) if end else ("end", 0), "doc": d.FullName}
+        out = {"heading_paragraph": n, "removed_paragraphs": removed, "removed_content": held,
+               "insert": ("before", first) if end else ("end", 0), "doc": d.FullName}
+        if kept:
+            out["layout_kept"] = kept
+        return out
     cut = await worker.run(fn, edit=True)
     where, para = cut.pop("insert")
     res = await word_insert_markdown(markdown, position=where, paragraph=para, base_dir=base_dir,

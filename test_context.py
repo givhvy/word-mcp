@@ -9,6 +9,9 @@ import time
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I leaves this folder off sys.path
+import tests_common  # noqa: E402
 from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +45,7 @@ async def call(s, tool, label="", **args):
 
 
 async def main():
+    tests_common.setup()
     os.makedirs(OUT, exist_ok=True)
     pic = os.path.join(OUT, "test-chart.png")
     im = Image.new("RGB", (480, 240), "white")
@@ -66,7 +70,7 @@ async def main():
                 if d["name"] not in before:
                     await s.call_tool("word_close", {"document": d["name"]})
         after = {d["name"] for d in (await call(s, "word_status"))["documents"]}
-        check(after == before, "only the test's documents were closed")
+        check(after == before, "only the test's documents were closed - " + tests_common.doc_diff(before, after))
     print("\nlatency (ms):")
     for label, ms in timings:
         print(f"  {ms:8.1f}  {label}")

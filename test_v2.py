@@ -14,6 +14,9 @@ import pythoncom
 import win32com.client
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I leaves this folder off sys.path
+import tests_common  # noqa: E402
 from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -71,6 +74,7 @@ class UserWord:
 
 
 async def main():
+    tests_common.setup()
     os.makedirs(OUT, exist_ok=True)
     arch = os.path.join(OUT, "v2-arch.png")
     make_png(arch, 1400, 600, "ARCHITECTURE DIAGRAM")
@@ -95,7 +99,7 @@ async def main():
                 if d["name"] not in before:
                     await s.call_tool("word_close", {"document": d["name"]})
         after = {d["name"] for d in (await call(s, "word_status"))["documents"]}
-        check(after == before, "only the test's documents were closed")
+        check(after == before, "only the test's documents were closed - " + tests_common.doc_diff(before, after))
     print("\nlatency (ms):")
     for label, ms in timings:
         print(f"  {ms:8.1f}  {label}")
@@ -173,7 +177,8 @@ async def scenario(s, doc, arch, svg, user):
 
     # Headings look like the document's own template (not the fragment fallback).
     look = await call(s, "word_com", path=f'Documents("{doc}").Paragraphs({ins["first_paragraph"]}).Range.Font.Name')
-    check(look == "Calibri Light", f"heading uses the template font ({look})")
+    own = await call(s, "word_com", path=f'Documents("{doc}").Styles(-3).Font.Name')  # the template's Heading 2
+    check(look == own, f"heading uses the document's own heading font ({look} vs template {own})")
 
     t2 = time.perf_counter()
     await ctx_text(s, "word_context (cached)", **D)

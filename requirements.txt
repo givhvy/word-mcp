@@ -1,4 +1,4 @@
-mcp>=1.10
+mcp>=1.10,<2
 pywin32>=306
 Pillow>=10.0
 markdown-it-py>=3.0

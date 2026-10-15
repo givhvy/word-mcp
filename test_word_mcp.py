@@ -11,6 +11,9 @@ import time
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I leaves this folder off sys.path
+import tests_common  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "test-output")
 timings: list[tuple[str, float]] = []
@@ -38,6 +41,7 @@ def check(cond, what):
 
 
 async def main():
+    tests_common.setup()
     os.makedirs(OUT, exist_ok=True)
     params = StdioServerParameters(command=sys.executable, args=["-I", os.path.join(HERE, "word_mcp_server.py")])
     t0 = time.perf_counter()
@@ -62,7 +66,9 @@ async def main():
                 if x["name"] not in user_docs:  # only ever close what the test created
                     await s.call_tool("word_close", {"document": x["name"]})
         end = await call(s, "word_status", "status (final)")
-        check({x["name"] for x in end["documents"]} == user_docs, "user's documents untouched, scratch docs closed")
+        now_docs = {x["name"] for x in end["documents"]}
+        check(now_docs == user_docs, "user's documents untouched, scratch docs closed - "
+              + tests_common.doc_diff(user_docs, now_docs))
     report()
 
 

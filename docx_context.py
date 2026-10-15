@@ -265,7 +265,7 @@ class Context:
             ps = ppr.find(W("pStyle"))
             sid = ps.get(W("val")) if ps is not None else None
             numpr = ppr.find(W("numPr"))
-        style = self.style_name.get(sid, sid or "Normal") if sid else "Normal"
+        style = display_style(self.style_name.get(sid, sid or "Normal")) if sid else "Normal"
         numpr = numpr if numpr is not None else self._style_numpr(sid)
         pieces: list[Piece] = []
         self._inline(p, pieces, n)
@@ -276,8 +276,12 @@ class Context:
         if numpr is not None:
             nid = numpr.find(W("numId"))
             abs_id = self.num_abs.get(nid.get(W("val"))) if nid is not None else None
+        plain = "".join(pc.text for pc in pieces if not pc.raw and pc.change != "del")
+        hidden = ppr is not None and on(ppr.find(W("rPr")), "vanish")
         self.para_meta.append({"n": n, "sid": sid or "Normal", "text": bool(text), "in_table": in_table,
-                               "list": self._num_kind(numpr), "abs": abs_id, "heading": level, "image": has_image})
+                               "list": self._num_kind(numpr), "abs": abs_id, "heading": level, "image": has_image,
+                               "plain": plain, "style": style, "hidden": hidden,
+                               "section_break": ppr is not None and ppr.find(W("sectPr")) is not None})
         if in_table:
             return text
         if not text:
@@ -332,6 +336,9 @@ class Context:
                 row.append("^" if vmerge and not cell else cell)
                 row.extend([""] * (span - 1))
             self.para += 1  # end-of-row mark is a paragraph in Word's numbering
+            self.para_meta.append({"n": self.para, "sid": "", "text": False, "in_table": True, "list": None,
+                                   "abs": None, "heading": None, "image": False, "plain": "", "style": "",
+                                   "hidden": False, "section_break": False, "row_end": True})
             rows.append(row)
         if not nested and rows:
             cols = max(len(r) for r in rows)
@@ -684,6 +691,17 @@ class Context:
             out.append(line)
             size += len(line) + 1
         return "\n".join(out), None
+
+
+def display_style(name: str) -> str:
+    """Word's display name for a style: styles.xml spells built-ins in lowercase ("heading 1",
+    "caption", "toc 2"); Word shows "Heading 1", "Caption", "TOC 2"."""
+    if not name or not name[0].islower():
+        return name
+    m = re.match(r"toc (\d)$", name)
+    if m:
+        return f"TOC {m.group(1)}"
+    return name[0].upper() + name[1:]
 
 
 def compose(pieces: list) -> str:
