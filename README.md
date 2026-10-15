@@ -80,6 +80,7 @@ python -I test_word_mcp.py
 python -I test_context.py
 python -I test_v2.py
 python -I test_styles.py
+python -I test_concurrent_user.py   # needs cua-driver: simulates a user paging through the document
 ```
 
 Each test creates its own scratch documents in your open Word, checks every tool, and closes only what
@@ -196,6 +197,25 @@ Measured on Word 16 (Microsoft 365), typical desktop:
 
 The largest cost in practice is the number of agent turns, not Word: prefer `word_insert_markdown`
 and `word_batch` over many small calls.
+
+## Working while you read or type
+
+You can keep reading, scrolling and typing in the document while the agent writes. The agent edits
+text ranges directly, not through your view or cursor, and targets headings rather than positions.
+
+Measured with `test_concurrent_user.py`: a simulated user paged up and down non-stop (163 PageUp /
+PageDown presses, also moving Word's cursor) while the agent made 52 calls - 8 inserts at section ends,
+formatting, comments, reads, 2 section rewrites, page renders:
+
+- every edit landed in the right section, exactly once; rewritten sections held only the new text;
+- `word_changes` never reported scrolling or cursor moves as edits;
+- the user's input was never blocked;
+- the agent got slower while Word was busy scrolling: 14.0 s -> 22.4 s for the workload
+  (median call 240 -> 444 ms).
+
+Things that do interact with you: `position="cursor"` writes at your cursor; `word_select` moves your
+cursor and view; Ctrl+Z and `word_undo` share one undo history with your own typing; an open dialog or
+menu makes Word refuse automation (the server retries for 5 s, then reports "Word is busy").
 
 ## Troubleshooting
 
