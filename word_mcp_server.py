@@ -1295,9 +1295,13 @@ def _page_list(pages: str, count: int) -> list[int]:
 
 
 @mcp.tool()
-async def word_page_image(pages: str = "1", dpi: int = 96, document: str = ""):
+async def word_page_image(pages: str = "1", dpi: int = 96, document: str = "", page: int = 0):
     """See pages exactly as Word lays them out (text, tables, images, header/footer), as PNGs.
-    pages: "1", "2-4", "1,3", "all" (max 10 per call). dpi 96 is screen size; up to 200 for small print."""
+    pages: "1", "2-4", "1,3", "all" (max 10 per call). dpi 96 is screen size; up to 200 for small print.
+    (`page` = one page number, kept for clients that cached the older schema.)"""
+    if page:
+        pages = str(page)
+
     def fn(app):
         d = get_doc(app, document)
         if d.Windows.Count == 0:
