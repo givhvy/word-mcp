@@ -73,6 +73,20 @@ args = ["-I", "C:\\path\\to\\word-mcp\\word_mcp_server.py"]
 
 If `python` is not on PATH for your client, use the full path to `python.exe`.
 
+### Update
+
+```powershell
+cd word-mcp
+git pull
+python -m pip install -r requirements.txt
+```
+
+Then restart your MCP client (Claude Code, Cursor, OpenCode, ...) so it starts the new server.
+`requirements.txt` pins `mcp>=1.10,<2`, so a local `<2` workaround is no longer needed and can be
+dropped. If anything still goes wrong, set `WORD_MCP_LOG=C:\path\word-mcp.log` in the client's
+environment for the server: every failed call is written there with its full trace - include that
+file when reporting an issue.
+
 ### Verify (optional)
 
 ```powershell
