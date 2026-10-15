@@ -9,3 +9,6 @@ __pycache__/
 *.pyc
 .venv/
 .claude/
+
+# Typelib extracted by tools/pe_inspect.py --extract-typelib
+*.tlb

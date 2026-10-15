@@ -1063,32 +1063,72 @@ async def word_format(paragraph: int | None = None, end_paragraph: int | None = 
     return await worker.run(fn, edit=True)
 
 
+def read_table(d, t) -> list[list[str]]:
+    """A table's cells as a 2D list; merged cells are walked one by one (slower, exact)."""
+    nr, nc = t.Rows.Count, t.Columns.Count
+    if t.Uniform:
+        cells = t.Range.Text.split("\r\x07")
+        # every row is nc cells plus an empty end-of-row marker
+        if len(cells) >= nr * (nc + 1):
+            return [[clean(cells[r * (nc + 1) + c]).strip() for c in range(nc)] for r in range(nr)]
+    grid = [[""] * nc for _ in range(nr)]
+    cs = t.Range.Cells
+    for k in range(1, cs.Count + 1):
+        c = cs(k)
+        grid[c.RowIndex - 1][c.ColumnIndex - 1] = clean(c.Range.Text[:-2]).strip()
+    return grid
+
+
+def find_table(d, table: int = 0, near: str = ""):
+    """Table by number (1-based, top-level tables in document order) or by text in one of its cells
+    (an exact cell first, then a cell containing it); must identify exactly one table."""
+    n = d.Tables.Count
+    if table:
+        if not 1 <= table <= n:
+            raise WordError(f"table {table} out of range (document has {n})")
+        return table, d.Tables(table)
+    if not near:
+        raise WordError("give table (number, see word_read_tables) or near (text inside the table)")
+    want = _alnum(near)
+    grids = {i: [c for row in read_table(d, d.Tables(i)) for c in row] for i in range(1, n + 1)}
+    for test in (lambda c: _alnum(c) == want, lambda c: want in _alnum(c)):
+        hits = [i for i, cells in grids.items() if any(test(c) for c in cells)]
+        if len(hits) == 1:
+            return hits[0], d.Tables(hits[0])
+        if len(hits) > 1:
+            raise WordError(f"near={near!r} matches tables {hits}; give table=N")
+    raise WordError(f"no table contains {near!r}")
+
+
 @mcp.tool()
-async def word_insert_table(rows: list[list[str]], after_paragraph: int = 0, header: bool = True,
-                            style: str = "auto", autofit: bool = True, document: str = "") -> dict:
+async def word_insert_table(rows: list[list[str]], position: str = "end", paragraph: int = 0, anchor: str = "",
+                            expect: str = "", header: bool = True, style: str = "auto", autofit: bool = True,
+                            after_paragraph: int = 0, in_tables: bool = False, document: str = "") -> dict:
     """Insert a table from a 2D list of cell strings (first row = header when header=true).
-    Placed after paragraph N, or at the end when after_paragraph=0.
-    style "auto" uses the document's own table style (house style; Table Grid if it has none)."""
+    Placed like word_insert: position "end" | "start" | "after" / "before" (paragraph N or `anchor` text) |
+    "section_end" (end of the section under heading `anchor`) | "cursor". after_paragraph=N is the older
+    form of position="after", paragraph=N. Anchors must match exactly one paragraph; targets are checked
+    against Word first. style "auto" uses the document's own table style (house style; Table Grid if none).
+    For formatted cells (bold, code, links) or a table inside a section of text, word_insert_markdown with
+    a | pipe | table | does the same in one call. Edit it afterwards with word_table_edit."""
     def fn(app):
-        nonlocal style
+        nonlocal style, position, paragraph
         if not rows or not rows[0]:
             raise WordError("rows must be a non-empty 2D list")
+        if after_paragraph:
+            position, paragraph = "after", after_paragraph
         d = get_doc(app, document)
         if style == "auto":
             style = get_context(d).house_style().get("table", {}).get("name", "Table Grid")
         cols = max(len(r) for r in rows)
-        cell = lambda v: str(v).replace("\t", " ").replace("\r", " ").replace("\n", " ")
-        body = "\r".join("\t".join(cell(v) for v in (r + [""] * (cols - len(r)))) for r in rows)
+        cell = lambda v: str(v).replace("\t", " ").replace("\r", " ").replace("\n", " ")  # noqa: E731
+        body = "\r".join("\t".join(cell(v) for v in (list(r) + [""] * (cols - len(r)))) for r in rows)
         with undo_step(app, "insert table", freeze=True):
-            if after_paragraph and after_paragraph < d.Paragraphs.Count:
-                check_para(d, after_paragraph)
-                pos = d.Paragraphs(after_paragraph + 1).Range.Start
-                d.Range(pos, pos).InsertBefore(body + "\r")
-                a, b = pos, pos + len(body)
-            else:
-                a, b = _append(d, body)
-            # One call builds the whole table instead of one call per cell.
+            a = new_paragraph_at(d, app, position, paragraph, anchor, expect, in_tables)
+            d.Range(a, a).InsertAfter(body)
+            b = a + len(body)
             plain_paragraphs(d, a, b)  # a table after a list must not inherit its numbering
+            # One call builds the whole table instead of one call per cell.
             t = d.Range(a, b).ConvertToTable(WD_SEPARATE_BY_TABS, len(rows), cols)
             if style:
                 try:
@@ -1101,42 +1141,227 @@ async def word_insert_table(rows: list[list[str]], after_paragraph: int = 0, hea
                     t.Rows(1).Range.Font.Bold = True
             if autofit:
                 t.AutoFitBehavior(1)  # wdAutoFitContent
-        idx = 0
-        for i in range(1, d.Tables.Count + 1):
-            if d.Tables(i).Range.Start == t.Range.Start:
-                idx = i
-                break
-        return {"table": idx, "rows": len(rows), "columns": cols}
+        start = t.Range.Start
+        idx = next((i for i in range(1, d.Tables.Count + 1) if d.Tables(i).Range.Start == start), 0)
+        first = para_index(d, start)
+        last = para_index(d, t.Range.End - 1)
+        return {"table": idx, "rows": len(rows), "columns": cols, **neighbours(d, first, last + 1)}
+    return await worker.run(fn, edit=True)
+
+
+TABLE_ACTIONS = ("add_rows", "delete_rows", "add_columns", "delete_columns", "fill", "merge", "split",
+                 "width", "shade", "align", "bold", "sort", "header_rows", "style", "autofit", "borders",
+                 "delete_table")
+
+
+@mcp.tool()
+async def word_table_edit(action: str, table: int = 0, near: str = "", row: int = 0, column: int = 0,
+                          end_row: int = 0, end_column: int = 0, count: int = 1,
+                          values: list | None = None, width_cm: float | None = None, color: str = "",
+                          align: str = "", on: bool = True, descending: bool = False, numeric: bool = False,
+                          style: str = "", fit: str = "contents", split_rows: int = 1, split_columns: int = 2,
+                          allow_content_loss: bool = False, document: str = "") -> dict:
+    """Change an existing table. Pick it by `table` number (see word_read_tables / word_context) or by
+    `near` = text in one of its cells. Rows/columns are 1-based; a cell range is row..end_row x
+    column..end_column, where row=0 means every row and column=0 every column.
+    actions:
+      add_rows      - `count` new rows after `row` (row=0: at the end); `values` = list of rows to fill them
+      delete_rows   - rows row..end_row
+      add_columns   - `count` new columns after `column` (0: at the end); `values` = one value per row
+                      (or a list of lists, one per new column)
+      delete_columns- columns column..end_column
+      fill          - write `values` (2D list) into the cells starting at row, column (default 1,1)
+      merge         - merge the range row,column..end_row,end_column into one cell
+      split         - split cell row,column into split_rows x split_columns
+      width         - column `column` (0 = all) to width_cm
+      shade         - background `color` (#RRGGBB, or "none") for the cell range
+      align         - horizontal `align` (left/center/right/justify) for the cell range
+      bold          - bold on/off (`on`) for the cell range
+      sort          - sort body rows by `column` (header row kept on top); descending, numeric
+      header_rows   - repeat the first `count` rows as a header on every page
+      style         - apply table style `style`
+      autofit       - fit "contents" | "window" | "fixed"
+      borders       - all borders on/off (`on`)
+      delete_table  - delete the whole table
+    Deleting rows/columns/the table is refused when it would remove pictures or comments unless
+    allow_content_loss=true. Returns the table's cells after the change."""
+    def fn(app):
+        if action not in TABLE_ACTIONS:
+            raise WordError(f"action must be one of: {', '.join(TABLE_ACTIONS)}")
+        nonlocal count
+        d = get_doc(app, document)
+        ti, t = find_table(d, table, near)
+        nr, nc = t.Rows.Count, t.Columns.Count
+        if values and action == "add_rows":
+            count = max(count, len(values))
+        if values and action == "add_columns":
+            count = max(count, len(values) if isinstance(values[0], list) else 1)
+
+        def rng_rows():
+            a = row or 1
+            b = (end_row or row) if row else nr
+            if not (1 <= a <= b <= nr):
+                raise WordError(f"rows {a}..{b} out of range (table {ti} has {nr} rows)")
+            return a, b
+
+        def rng_cols():
+            a = column or 1
+            b = (end_column or column) if column else nc
+            if not (1 <= a <= b <= nc):
+                raise WordError(f"columns {a}..{b} out of range (table {ti} has {nc} columns)")
+            return a, b
+
+        def cells(r1, r2, c1, c2):
+            for i in range(r1, r2 + 1):
+                for j in range(c1, c2 + 1):
+                    try:
+                        yield t.Cell(i, j)
+                    except pywintypes.com_error:
+                        pass  # merged away
+
+        def guard(ranges, what):
+            imgs = sum(r.InlineShapes.Count for r in ranges)
+            cmts = sum(r.Comments.Count for r in ranges)
+            if (imgs or cmts) and not allow_content_loss:
+                raise WordError(f"{what} would remove {imgs} picture(s) and {cmts} comment(s); nothing was "
+                                "changed. Pass allow_content_loss=true to do it anyway.")
+
+        def merged_hint(e):
+            return WordError(f"{com_message(e)} - table {ti} has merged cells, so whole rows/columns cannot be "
+                             "addressed; split the merged cells first or work cell by cell")
+
+        result_extra = {}
+        with undo_step(app, f"table {action}", freeze=True):
+            try:
+                if action == "add_rows":
+                    after = row or nr
+                    if not 0 <= after <= nr:
+                        raise WordError(f"row {after} out of range (table {ti} has {nr} rows)")
+                    for k in range(count):
+                        if after + k < t.Rows.Count:
+                            t.Rows.Add(t.Rows(after + k + 1))
+                        else:
+                            t.Rows.Add()
+                    for k, vals in enumerate(values or []):
+                        for j, v in enumerate(vals if isinstance(vals, list) else [vals]):
+                            if j < t.Columns.Count and k < count:
+                                t.Cell(after + k + 1, j + 1).Range.Text = str(v)
+                elif action == "delete_rows":
+                    a, b = rng_rows()
+                    if a == 1 and b == nr:
+                        raise WordError("that is every row: use action=delete_table")
+                    guard([t.Rows(i).Range for i in range(a, b + 1)], f"deleting rows {a}-{b}")
+                    for i in range(b, a - 1, -1):
+                        t.Rows(i).Delete()
+                elif action == "add_columns":
+                    after = column or nc
+                    if not 0 <= after <= nc:
+                        raise WordError(f"column {after} out of range (table {ti} has {nc} columns)")
+                    for k in range(count):
+                        if after + k < t.Columns.Count:
+                            t.Columns.Add(t.Columns(after + k + 1))
+                        else:
+                            t.Columns.Add()
+                    cols = values or []
+                    if cols and not isinstance(cols[0], list):
+                        cols = [cols]
+                    for k, col_vals in enumerate(cols[:count]):
+                        for i, v in enumerate(col_vals[: t.Rows.Count]):
+                            t.Cell(i + 1, after + k + 1).Range.Text = str(v)
+                elif action == "delete_columns":
+                    a, b = rng_cols()
+                    if a == 1 and b == nc:
+                        raise WordError("that is every column: use action=delete_table")
+                    guard([c.Range for c in cells(1, nr, a, b)], f"deleting columns {a}-{b}")
+                    for j in range(b, a - 1, -1):
+                        t.Columns(j).Delete()
+                elif action == "fill":
+                    if not values or not isinstance(values[0], list):
+                        raise WordError("fill needs values as a 2D list (rows of cells)")
+                    r0, c0 = row or 1, column or 1
+                    if r0 + len(values) - 1 > nr or c0 + max(len(v) for v in values) - 1 > nc:
+                        raise WordError(f"values do not fit: table {ti} is {nr}x{nc}; add rows/columns first")
+                    for i, vals in enumerate(values):
+                        for j, v in enumerate(vals):
+                            t.Cell(r0 + i, c0 + j).Range.Text = str(v)
+                elif action == "merge":
+                    if not (row and column and end_row and end_column):
+                        raise WordError("merge needs row, column, end_row, end_column")
+                    t.Cell(row, column).Merge(t.Cell(end_row, end_column))
+                elif action == "split":
+                    t.Cell(row or 1, column or 1).Split(split_rows, split_columns)
+                elif action == "width":
+                    if not width_cm:
+                        raise WordError("width needs width_cm")
+                    a, b = rng_cols()
+                    for j in range(a, b + 1):
+                        try:
+                            t.Columns(j).Width = width_cm * CM_TO_PT
+                        except pywintypes.com_error:  # merged cells: set it cell by cell
+                            for c in cells(1, nr, j, j):
+                                c.Width = width_cm * CM_TO_PT
+                elif action in ("shade", "align", "bold"):
+                    r1, r2 = rng_rows()
+                    c1, c2 = rng_cols()
+                    if action == "shade":
+                        if not color:
+                            raise WordError('shade needs color (#RRGGBB or "none")')
+                        val = -16777216 if color.lower() == "none" else color_bgr(color)  # wdColorAutomatic
+                    elif action == "align":
+                        if align.lower() not in ALIGN:
+                            raise WordError("align must be left, center, right or justify")
+                        val = ALIGN[align.lower()]
+                    for c in cells(r1, r2, c1, c2):
+                        if action == "shade":
+                            c.Shading.BackgroundPatternColor = val
+                        elif action == "align":
+                            c.Range.ParagraphFormat.Alignment = val
+                        else:
+                            c.Range.Font.Bold = on
+                elif action == "sort":
+                    # Sort(ExcludeHeader, FieldNumber, SortFieldType 0=alphanumeric 1=numeric, SortOrder 0=asc 1=desc)
+                    t.Sort(True, column or 1, 1 if numeric else 0, 1 if descending else 0)
+                elif action == "header_rows":
+                    for i in range(1, nr + 1):
+                        t.Rows(i).HeadingFormat = i <= count
+                elif action == "style":
+                    if not style:
+                        raise WordError("style needs a table style name (see word_styles)")
+                    t.Style = style
+                elif action == "autofit":
+                    kinds = {"fixed": 0, "contents": 1, "window": 2}
+                    if fit not in kinds:
+                        raise WordError("fit must be contents, window or fixed")
+                    t.AutoFitBehavior(kinds[fit])
+                elif action == "borders":
+                    t.Borders.Enable = on
+                elif action == "delete_table":
+                    guard([t.Range], f"deleting table {ti}")
+                    result_extra["deleted_table"] = ti
+                    t.Delete()
+                    return {"action": action, **result_extra, "tables_left": d.Tables.Count}
+            except pywintypes.com_error as e:
+                err = merged_hint(e) if "merged" in com_message(e).lower() else WordError(com_message(e))
+                raise err from None
+        t = d.Tables(ti)
+        return {"action": action, "table": ti, "rows": t.Rows.Count, "columns": t.Columns.Count,
+                "cells": read_table(d, t)[:30]}
     return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
-async def word_read_tables(table: int = 0, document: str = "") -> dict:
-    """Read tables as 2D lists of cell text. table=0 reads all, N reads table N (1-based)."""
+async def word_read_tables(table: int = 0, near: str = "", document: str = "") -> dict:
+    """Read tables as 2D lists of cell text. table=0 reads all, N reads table N (1-based);
+    near reads the one table that contains that text."""
     def fn(app):
         d = get_doc(app, document)
         n = d.Tables.Count
-        which = [table] if table else list(range(1, n + 1))
+        which = [find_table(d, table, near)[0]] if (table or near) else list(range(1, n + 1))
         out = []
         for i in which:
-            if not 1 <= i <= n:
-                raise WordError(f"table {i} out of range (document has {n})")
             t = d.Tables(i)
-            nr, nc = t.Rows.Count, t.Columns.Count
-            grid = None
-            if t.Uniform:
-                cells = t.Range.Text.split("\r\x07")
-                # every row is nc cells plus an empty end-of-row marker
-                if len(cells) >= nr * (nc + 1):
-                    grid = [[clean(cells[r * (nc + 1) + c]) for c in range(nc)] for r in range(nr)]
-            if grid is None:  # merged cells: walk them (slower, exact)
-                grid = [[""] * nc for _ in range(nr)]
-                cs = t.Range.Cells
-                for k in range(1, cs.Count + 1):
-                    c = cs(k)
-                    grid[c.RowIndex - 1][c.ColumnIndex - 1] = clean(c.Range.Text[:-2])
-            out.append({"table": i, "rows": nr, "columns": nc, "first_paragraph": para_index(d, t.Range.Start),
-                        "cells": grid})
+            out.append({"table": i, "rows": t.Rows.Count, "columns": t.Columns.Count,
+                        "first_paragraph": para_index(d, t.Range.Start), "cells": read_table(d, t)})
         return {"table_count": n, "tables": out}
     return await worker.run(fn)
 

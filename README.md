@@ -95,6 +95,7 @@ python -I test_context.py
 python -I test_v2.py
 python -I test_styles.py
 python -I test_anchors.py           # anchors, numbering and deletes on a section-break / table-heavy document
+python -I test_tables.py            # table insert placement and every word_table_edit action
 python -I test_concurrent_user.py   # needs cua-driver: simulates a user paging through the document
 ```
 
@@ -182,13 +183,14 @@ Word's built-in style. Nothing is copied or duplicated: Word applies the documen
 - `word_insert_markdown(..., style_overrides={"table": "Company Table", "caption_label": "Fig."})`
   pins roles; `styles="builtin"` ignores the house style.
 
-## Tools (44)
+## Tools (45)
 
 | Area | Tools |
 |---|---|
 | Read | `word_context` (whole document), `word_changes` (what the user changed), `word_status`, `word_read`, `word_get_text`, `word_find`, `word_read_tables` |
 | See | `word_page_image` (rendered pages), `word_get_image`, `word_list_images` |
-| Write | `word_insert_markdown` (whole sections), `word_replace_section`, `word_insert` (plain text), `word_set_paragraph`, `word_delete_paragraphs`, `word_replace`, `word_insert_table`, `word_set_cell`, `word_undo` |
+| Write | `word_insert_markdown` (whole sections), `word_replace_section`, `word_insert` (plain text), `word_set_paragraph`, `word_delete_paragraphs`, `word_replace`, `word_undo` |
+| Tables | `word_insert_table` (placed by heading/anchor like word_insert), `word_table_edit` (add/delete rows and columns, fill, merge, split, column width, shading, alignment, bold, sort, header rows, style, autofit, borders, delete table; pick the table by number or by text in it), `word_read_tables`, `word_set_cell` |
 | Images | `word_insert_image` (path, base64 or URL; caption; replace an image in place) |
 | Format | `word_styles` (house style), `word_apply_styles` (from a template), `word_format`, `word_page_setup`, `word_header_footer`, `word_insert_toc`, `word_update_fields` |
 | Comments | `word_add_comment`, `word_reply_comment`, `word_list_comments`, `word_resolve_comment`, `word_edit_comment`, `word_delete_comment` |
@@ -198,10 +200,18 @@ Word's built-in style. Nothing is copied or duplicated: Word applies the documen
 
 ## How it works
 
-**Maintainers and agents fixing errors:** read [docs/WORD_INTERNALS.md](docs/WORD_INTERNALS.md) - the
-reverse-engineered internals of Word (binaries, automation API, text and paragraph model, WordOpenXML,
-`InsertXML` behaviour, COM error codes, surprising behaviours), this server's architecture and
-invariants, and a symptom -> cause -> fix playbook. [AGENTS.md](AGENTS.md) has the working rules.
+**Maintainers and agents fixing errors** (no REA needed):
+
+- [docs/REA_ANALYSIS.md](docs/REA_ANALYSIS.md) - the full reverse-engineering record of Word: binaries,
+  hashes, resources, imports/exports, the type library, why the engine was not decompiled, and how to
+  reproduce every step with `tools/pe_inspect.py` and `dump_typelib.ps1`;
+- [docs/WORD_API_REFERENCE.md](docs/WORD_API_REFERENCE.md) - every member and signature of the Word
+  interfaces and enums the server uses, generated from Word's type library by `tools/api_reference.py`;
+- [docs/WORD_INTERNALS.md](docs/WORD_INTERNALS.md) - what was learned: Word's text and paragraph model,
+  WordOpenXML, `InsertXML` behaviour, COM error codes, surprising behaviours, this server's architecture
+  and invariants, and a symptom -> cause -> fix playbook.
+
+[AGENTS.md](AGENTS.md) has the working rules for agents changing the code.
 
 - `word_mcp_server.py` (FastMCP, stdio). One dedicated COM thread owns every Word object; it attaches to
   the running Word, retries while Word is busy, and reconnects if Word restarts.

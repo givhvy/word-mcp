@@ -1,5 +1,9 @@
 # Word internals for word-mcp maintainers
 
+Companion documents: [REA_ANALYSIS.md](REA_ANALYSIS.md) (how Word was reverse engineered, with evidence,
+and how to reproduce it without REA) and [WORD_API_REFERENCE.md](WORD_API_REFERENCE.md) (generated
+signatures of the Word API the server uses).
+
 Everything this project learned by reverse engineering and measuring Microsoft Word, written so that an
 agent which hits an error while using or changing word-mcp can find the cause and fix it without
 rediscovering it. Facts are from Word 16 (Microsoft 365, builds 16.0.14332 and 16.0.20326) on Windows
@@ -331,6 +335,7 @@ Key functions in `word_mcp_server.py`:
 | `house_for(d, mode, overrides)` | styles for new content |
 | `undo_step(app, label, freeze)` | one Ctrl+Z step, optional ScreenUpdating freeze |
 | `safe(fn, default)` | property reads Word may refuse |
+| `find_table(d, table, near)` / `read_table(d, t)` | a table by number or by unique text in a cell; its cells as a grid (merged cells walked one by one) |
 
 Invariants - keep them when changing code:
 
@@ -393,13 +398,13 @@ text, `in_table`, `row_end`, `heading` level, `list` kind and `abs` (abstractNum
    test (`Range.Information(12)` for "in a table", `Information(2)` for the section, `Sections.Count`,
    `InlineShapes.Count`, `Comments.Count`).
 4. **Add a regression check** to the matching suite (`test_anchors.py` for placement/numbering,
-   `test_styles.py` for styling, `test_context.py` for reading/comments/images, `test_v2.py` for
+   `test_styles.py` for styling, `test_tables.py` for tables, `test_context.py` for reading/comments/images, `test_v2.py` for
    markdown/changes/batch, `test_word_mcp.py` for the basic tools, `test_concurrent_user.py` for a user
    working at the same time).
 5. **Run every suite, one at a time**, all must end with `ALL CHECKS PASSED`:
 
    ```powershell
-   python -I test_anchors.py; python -I test_word_mcp.py; python -I test_context.py
+   python -I test_anchors.py; python -I test_tables.py; python -I test_word_mcp.py; python -I test_context.py
    python -I test_v2.py; python -I test_styles.py; python -I test_concurrent_user.py
    ```
 
