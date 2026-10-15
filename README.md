@@ -198,6 +198,11 @@ Word's built-in style. Nothing is copied or duplicated: Word applies the documen
 
 ## How it works
 
+**Maintainers and agents fixing errors:** read [docs/WORD_INTERNALS.md](docs/WORD_INTERNALS.md) - the
+reverse-engineered internals of Word (binaries, automation API, text and paragraph model, WordOpenXML,
+`InsertXML` behaviour, COM error codes, surprising behaviours), this server's architecture and
+invariants, and a symptom -> cause -> fix playbook. [AGENTS.md](AGENTS.md) has the working rules.
+
 - `word_mcp_server.py` (FastMCP, stdio). One dedicated COM thread owns every Word object; it attaches to
   the running Word, retries while Word is busy, and reconnects if Word restarts.
 - `md_to_word.py` turns markdown into a WordprocessingML fragment that Word imports with
