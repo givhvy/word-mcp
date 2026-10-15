@@ -8,6 +8,7 @@ reads, tab-separated table conversion) so calls stay in the few-millisecond rang
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
 import io
 import json
@@ -86,13 +87,16 @@ class ComWorker:
     def _loop(self) -> None:
         pythoncom.CoInitialize()
         while True:
-            fn, fut = self._jobs.get()
+            fn, fut, edit = self._jobs.get()
             if not fut.set_running_or_notify_cancel():
                 continue
             try:
                 fut.set_result(self._call(fn))
             except BaseException as e:  # noqa: BLE001 - surfaced to the client
                 fut.set_exception(e)
+            finally:
+                if edit:
+                    after_agent_edit(self)
 
     def app(self):
         if self._app is None:
@@ -124,9 +128,11 @@ class ComWorker:
                     raise WordError("Word is busy: close any open dialog in Word and retry") from None
                 raise WordError(com_message(e)) from None
 
-    async def run(self, fn: Callable[[Any], Any]):
+    async def run(self, fn: Callable[[Any], Any], edit: bool = False):
+        """Run fn(app) on the COM thread. edit=True marks an agent edit: afterwards the
+        change baselines are refreshed so word_changes only reports other people's edits."""
         fut: concurrent.futures.Future = concurrent.futures.Future()
-        self._jobs.put((fn, fut))
+        self._jobs.put((fn, fut, edit))
         try:
             return await asyncio.wait_for(asyncio.wrap_future(fut), CALL_TIMEOUT)
         except asyncio.TimeoutError:
@@ -135,10 +141,18 @@ class ComWorker:
 
 worker = ComWorker()
 mcp = FastMCP("word", log_level="WARNING", instructions=(
-    "Controls the Microsoft Word instance running on this PC. Paragraph numbers are 1-based, as in Word. "
-    "Most tools take an optional `document` (name or full path); default is the active document. "
-    "Start with word_status, read with word_read, then edit. Every edit is one Ctrl+Z step in Word. "
-    "For anything without a dedicated tool use word_com, and word_api_search to look up the Word object model."))
+    "Works live inside the Microsoft Word open on this PC (local files and SharePoint/OneDrive documents "
+    "opened in Word desktop); edits appear instantly in the user's window.\n"
+    "Workflow: 1) word_context reads the whole live document (text, structure, images, comments, the user's "
+    "unsaved edits) with Word paragraph numbers [pN]. 2) Write with word_insert_markdown - a whole section "
+    "(headings, lists, code blocks, tables, images with captions) in ONE call; rewrite a section with "
+    "word_replace_section. 3) Target places by `anchor` (a heading's or paragraph's text) rather than numbers "
+    "when the user may be editing too; pass `expect` with numbers. 4) Before further edits, word_changes "
+    "shows what the user changed since your last read (cheap). 5) Check layout with word_page_image.\n"
+    "NEVER save (word_save / word_close save=true) unless the user explicitly asks: saving is the user's "
+    "decision (they press Ctrl+S). Every edit is one Ctrl+Z step. Several small steps: word_batch.\n"
+    "Anything without a tool: word_api_search + word_com (full Word object model). Most tools take an "
+    "optional `document` (name or full path/URL); default is the active document."))
 
 
 # --- helpers (run on the COM thread) -------------------------------------------
@@ -297,6 +311,163 @@ def py_value(v: Any) -> Any:
     return str(v)
 
 
+# --- change baselines, context cache, anchors (COM thread) ------------------------
+
+SNAPSHOTS: dict[str, dict] = {}   # FullName -> what the agent last saw (word_changes baseline)
+CTX_CACHE: dict[str, tuple] = {}  # FullName -> (fingerprint, Context)
+STYLES_READY: set[str] = set()    # documents whose built-in styles were instantiated
+EDITS = [0]                       # bumps on every agent edit (part of the context fingerprint)
+
+
+def paragraph_texts(d) -> list[str]:
+    """Every paragraph's plain text from one Content.Text read (table cells count, as in Word)."""
+    parts = d.Content.Text.split("\r")
+    if parts and parts[-1] == "":
+        parts.pop()
+    return [clean(p).strip() for p in parts]
+
+
+def doc_counts(d) -> dict:
+    return {"images": d.InlineShapes.Count + d.Shapes.Count, "comments": d.Comments.Count,
+            "tables": d.Tables.Count, "tracked_changes": d.Revisions.Count}
+
+
+def take_snapshot(d, texts: list[str] | None = None) -> None:
+    SNAPSHOTS[d.FullName] = {"texts": texts if texts is not None else paragraph_texts(d), "counts": doc_counts(d)}
+
+
+def after_agent_edit(w: "ComWorker") -> None:
+    """The agent's own edits must not show up in word_changes: re-baseline every tracked document."""
+    EDITS[0] += 1
+    if not SNAPSHOTS or w._app is None:
+        return
+    try:
+        app = w._app
+        open_docs = {app.Documents(i).FullName: app.Documents(i) for i in range(1, app.Documents.Count + 1)}
+        for name in list(SNAPSHOTS):
+            if name in open_docs:
+                take_snapshot(open_docs[name])
+            else:
+                SNAPSHOTS.pop(name)
+    except pywintypes.com_error:
+        pass
+
+
+def get_context(d, refresh: bool = False) -> Context:
+    """Parsed WordOpenXML, reused while the document is unchanged (text, images, comments,
+    tracked changes and agent edits are all part of the fingerprint)."""
+    fp = (hash(d.Content.Text), d.InlineShapes.Count, d.Shapes.Count, d.Comments.Count,
+          d.Revisions.Count, EDITS[0])
+    hit = CTX_CACHE.get(d.FullName)
+    if hit and hit[0] == fp and not refresh:
+        return hit[1]
+    ctx = Context(d.WordOpenXML)
+    CTX_CACHE[d.FullName] = (fp, ctx)
+    return ctx
+
+
+def _norm(t: str) -> str:
+    return re.sub(r"\s+", " ", t.strip().lstrip("#").strip()).lower()
+
+
+def locate(d, paragraph: int | None = None, anchor: str = "", expect: str = "",
+           texts: list[str] | None = None) -> int:
+    """Paragraph number from a number or an anchor text (a heading or any paragraph), checking
+    `expect` so an edit never lands on a paragraph that changed since the agent read it."""
+    texts = texts if texts is not None else paragraph_texts(d)
+    if anchor:
+        want = _norm(anchor)
+        hits = [i + 1 for i, t in enumerate(texts) if _norm(t) == want]
+        hits = hits or [i + 1 for i, t in enumerate(texts) if _norm(t).startswith(want)]
+        hits = hits or [i + 1 for i, t in enumerate(texts) if want in _norm(t)]
+        if not hits:
+            raise WordError(f"no paragraph matches anchor {anchor!r}; re-read with word_context")
+        n = hits[0]
+    elif paragraph:
+        n = paragraph
+        if not 1 <= n <= len(texts):
+            raise WordError(f"paragraph {n} is out of range (document has {len(texts)})")
+    else:
+        raise WordError("give paragraph or anchor")
+    if expect and not _norm(texts[n - 1]).startswith(_norm(expect)):
+        raise WordError(f"paragraph {n} now reads {texts[n - 1][:80]!r}, not {expect!r}: the document changed "
+                        "since you read it. Re-read (word_changes / word_context) or target it by anchor.")
+    return n
+
+
+def section_end(d, n: int) -> int | None:
+    """Paragraph number where the section started by heading n ends (next heading of the same or a
+    higher level), or None when it runs to the end of the document."""
+    levels = get_context(d).heading_level
+    if n not in levels:
+        raise WordError(f"paragraph {n} is not a heading; section_end needs a heading anchor")
+    lvl = levels[n]
+    nxt = [m for m, l in levels.items() if m > n and l <= lvl]
+    return min(nxt) if nxt else None
+
+
+def new_paragraph_at(d, app, position: str, paragraph: int = 0, anchor: str = "", expect: str = "") -> int:
+    """Create one empty Normal paragraph at the requested place and return its start position.
+    position: end | start | after | before | section_end (anchor = heading) | cursor (after the
+    paragraph holding the cursor)."""
+    if position == "end":
+        pos, _ = _append(d, "")
+    elif position == "start":
+        d.Range(0, 0).InsertBefore("\r")
+        pos = 0
+    elif position == "cursor":
+        p = para_index(d, app.Selection.Start)
+        return new_paragraph_at(d, app, "after", p)
+    elif position in ("after", "before", "section_end"):
+        texts = paragraph_texts(d)
+        n = locate(d, paragraph or None, anchor, expect, texts)
+        if position == "section_end":
+            end = section_end(d, n)
+            if end is None:
+                return new_paragraph_at(d, app, "end")
+            return new_paragraph_at(d, app, "before", end)
+        if position == "after" and n == len(texts):
+            pos, _ = _append(d, "")
+        else:
+            pos = d.Paragraphs(n + 1 if position == "after" else n).Range.Start
+            d.Range(pos, pos).InsertBefore("\r")
+    else:
+        raise WordError("position must be end, start, after, before, section_end or cursor")
+    plain_paragraphs(d, pos, pos)
+    return pos
+
+
+def prepare_styles(d) -> None:
+    """Instantiate the built-in styles a markdown fragment uses, so the inserted XML takes the
+    document's own (template) look instead of the fragment's fallback definitions."""
+    if d.FullName in STYLES_READY:
+        return
+    for sid in (-2, -3, -4, -5, -6, -7, -63, -181, -35, -180, -86):
+        try:
+            s = d.Styles(sid)
+            s.Priority = s.Priority
+        except pywintypes.com_error:
+            pass
+    try:
+        s = d.Styles("Table Grid")
+        s.Priority = s.Priority
+    except pywintypes.com_error:
+        pass
+    STYLES_READY.add(d.FullName)
+
+
+def usable_width_cm(d, pos: int) -> float:
+    ps = d.Range(pos, pos).Sections(1).PageSetup
+    return max(4.0, (ps.PageWidth - ps.LeftMargin - ps.RightMargin) / CM_TO_PT)
+
+
+def autosave_state(d):
+    try:
+        return bool(d.AutoSaveOn)
+    except (pywintypes.com_error, AttributeError):
+        return None
+
+
 # --- tools ---------------------------------------------------------------------
 
 @mcp.tool()
@@ -306,7 +477,8 @@ async def word_status() -> dict:
         docs = []
         for i in range(1, app.Documents.Count + 1):
             d = app.Documents(i)
-            docs.append({"name": d.Name, "path": d.FullName, "saved": bool(d.Saved)})
+            docs.append({"name": d.Name, "path": d.FullName, "saved": bool(d.Saved),
+                         "cloud": d.FullName.lower().startswith("http"), "autosave": autosave_state(d)})
         out = {"version": app.Version, "build": app.Build, "documents": docs}
         if docs:
             d = app.ActiveDocument
@@ -330,18 +502,25 @@ async def word_new_document(text: str = "", template: str = "") -> dict:
         if text:
             d.Content.Text = to_word(text)
         return {"name": d.Name, "paragraphs": d.Paragraphs.Count}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
 async def word_open(path: str, read_only: bool = False) -> dict:
-    """Open a document from disk (.docx, .doc, .rtf, .txt, .pdf, ...) and make it active.
+    """Open a document (.docx, .doc, .rtf, .txt, .pdf, ...) from disk or a SharePoint / OneDrive URL
+    (https://...), and make it active. If it is already open it is just activated.
     Note: like Word's own File > Open, this replaces a lone, untouched blank new document
     (reported as replaced_blank_document)."""
     def fn(app):
-        full = os.path.abspath(path)
-        if not os.path.exists(full):
+        url = re.match(r"https?://", path.strip(), re.I) is not None
+        full = path.strip() if url else os.path.abspath(path)
+        if not url and not os.path.exists(full):
             raise WordError(f"file not found: {full}")
+        for i in range(1, app.Documents.Count + 1):
+            if app.Documents(i).FullName.lower() == full.lower():
+                d = app.Documents(i)
+                d.Activate()
+                return {"name": d.Name, "path": d.FullName, "paragraphs": d.Paragraphs.Count, "already_open": True}
         blank = None
         if app.Documents.Count == 1:
             only = app.Documents(1)
@@ -358,7 +537,7 @@ async def word_open(path: str, read_only: bool = False) -> dict:
         if blank and all(app.Documents(i).Name != blank for i in range(1, app.Documents.Count + 1)):
             out["replaced_blank_document"] = blank
         return out
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -399,7 +578,7 @@ async def word_close(save: bool = False, document: str = "") -> dict:
             raise WordError("document was never saved: call word_save with a path first")
         d.Close(-1 if save else 0)
         return {"closed": name, "saved": save}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -426,6 +605,7 @@ async def word_read(start_paragraph: int = 1, end_paragraph: int = 0, with_style
             return {"paragraph_count": count, "paragraphs": []}
         if first == 1 and last == count:
             raw = d.Content.Text
+            take_snapshot(d)  # a full read is a word_changes baseline too
         else:
             raw = d.Range(d.Paragraphs(first).Range.Start, d.Paragraphs(last).Range.End).Text
         parts = raw.split("\r")
@@ -452,12 +632,15 @@ async def word_get_text(document: str = "") -> str:
 
 
 @mcp.tool()
-async def word_insert(text: str, position: str = "end", paragraph: int = 0, style: str = "",
-                      document: str = "") -> dict:
-    """Insert text; newlines make new paragraphs.
-    position: "end" | "start" | "after" (paragraph N) | "before" (paragraph N) | "cursor" (at the selection).
-    style applies a paragraph style (e.g. "Heading 1", "Title", "List Bullet") to the inserted paragraphs;
-    without it new paragraphs are Normal (they do not inherit a neighbouring heading or list style)."""
+async def word_insert(text: str, position: str = "end", paragraph: int = 0, anchor: str = "", expect: str = "",
+                      style: str = "", document: str = "") -> dict:
+    """Insert plain text; newlines make new paragraphs. For formatted content (headings, lists, code,
+    tables, images) use word_insert_markdown instead: one call for a whole section.
+    position: "end" | "start" | "after" / "before" (paragraph N or `anchor`) | "section_end" (end of the
+    section under heading `anchor`) | "cursor" (typed at the selection, inline).
+    anchor: text of the target paragraph (e.g. a heading) - robust when the user edits the document too.
+    expect: start of paragraph N's current text; the edit is refused if it no longer matches.
+    style applies a paragraph style ("Heading 1", "List Bullet", ...); without it new paragraphs are Normal."""
     def fn(app):
         d = get_doc(app, document)
         body = to_word(text)
@@ -467,29 +650,15 @@ async def word_insert(text: str, position: str = "end", paragraph: int = 0, styl
                 r.Text = body
                 a, b = r.Start, r.End
                 app.Selection.SetRange(b, b)
-            elif position == "start":
-                d.Range(0, 0).InsertBefore(body + "\r")
-                a, b = 0, len(body)
-            elif position in ("before", "after"):
-                count = check_para(d, paragraph)
-                if position == "after" and paragraph == count:
-                    a, b = _append(d, body)
-                else:
-                    target = paragraph + 1 if position == "after" else paragraph
-                    pos = d.Paragraphs(target).Range.Start
-                    d.Range(pos, pos).InsertBefore(body + "\r")
-                    a, b = pos, pos + len(body)
-            elif position == "end":
-                a, b = _append(d, body)
             else:
-                raise WordError('position must be end, start, after, before or cursor')
-            if style:
-                d.Range(a, b).Style = resolve_style(d, style)
-            elif position != "cursor":
-                plain_paragraphs(d, a, b)
-        return {"start": a, "end": b, "first_paragraph": para_index(d, a),
-                "last_paragraph": para_index(d, b), "paragraph_count": d.Paragraphs.Count}
-    return await worker.run(fn)
+                a = new_paragraph_at(d, app, position, paragraph, anchor, expect)
+                d.Range(a, a).InsertAfter(body)
+                b = a + len(body)
+                if style:
+                    d.Range(a, b).Style = resolve_style(d, style)
+        return {"first_paragraph": para_index(d, a), "last_paragraph": para_index(d, b),
+                "paragraph_count": d.Paragraphs.Count}
+    return await worker.run(fn, edit=True)
 
 
 def _append(d, body: str) -> tuple[int, int]:
@@ -503,30 +672,34 @@ def _append(d, body: str) -> tuple[int, int]:
 
 
 @mcp.tool()
-async def word_set_paragraph(paragraph: int, text: str, document: str = "") -> dict:
-    """Replace one paragraph's text, keeping its paragraph formatting and style."""
+async def word_set_paragraph(text: str, paragraph: int = 0, anchor: str = "", expect: str = "",
+                             document: str = "") -> dict:
+    """Replace one paragraph's text (by number or `anchor` text), keeping its style and formatting.
+    expect: start of the paragraph's current text; refused if the document changed."""
     def fn(app):
         d = get_doc(app, document)
-        check_para(d, paragraph)
-        r = d.Paragraphs(paragraph).Range
+        n = locate(d, paragraph or None, anchor, expect)
+        r = d.Paragraphs(n).Range
         with undo_step(app, "set paragraph"):
             d.Range(r.Start, r.End - 1).Text = to_word(text)
-        return {"paragraph": paragraph, "paragraph_count": d.Paragraphs.Count}
-    return await worker.run(fn)
+        return {"paragraph": n, "paragraph_count": d.Paragraphs.Count}
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
-async def word_delete_paragraphs(start_paragraph: int, end_paragraph: int = 0, document: str = "") -> dict:
-    """Delete paragraphs start..end (inclusive; end defaults to start)."""
+async def word_delete_paragraphs(start_paragraph: int = 0, end_paragraph: int = 0, anchor: str = "",
+                                 expect: str = "", document: str = "") -> dict:
+    """Delete paragraphs start..end (inclusive; end defaults to start). `anchor` picks the start paragraph
+    by its text; `expect` refuses the delete if the start paragraph no longer reads like that."""
     def fn(app):
         d = get_doc(app, document)
-        last = end_paragraph or start_paragraph
-        check_para(d, start_paragraph)
+        first = locate(d, start_paragraph or None, anchor, expect)
+        last = max(first, end_paragraph or first)
         check_para(d, last)
-        with undo_step(app, "delete paragraphs", freeze=last - start_paragraph > 20):
-            d.Range(d.Paragraphs(start_paragraph).Range.Start, d.Paragraphs(last).Range.End).Delete()
-        return {"deleted": last - start_paragraph + 1, "paragraph_count": d.Paragraphs.Count}
-    return await worker.run(fn)
+        with undo_step(app, "delete paragraphs", freeze=last - first > 20):
+            d.Range(d.Paragraphs(first).Range.Start, d.Paragraphs(last).Range.End).Delete()
+        return {"deleted": last - first + 1, "paragraph_count": d.Paragraphs.Count}
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -562,7 +735,7 @@ async def word_replace(find: str, replace: str, replace_all: bool = True, match_
                              to_word(replace), 2 if replace_all else 1)
         count = (before if replace_all else min(1, before)) if before is not None else None
         return {"replaced": bool(done), "count": count if done else 0}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -573,14 +746,18 @@ async def word_format(paragraph: int | None = None, end_paragraph: int | None = 
                       strikethrough: bool | None = None, font: str = "", size: float | None = None,
                       color: str = "", highlight: str = "", style: str = "", align: str = "",
                       space_after: float | None = None, line_spacing: float | None = None,
-                      document: str = "") -> dict:
-    """Format text. Target: paragraph (to end_paragraph), or every match of `find` (or just `occurrence` N),
-    or start+end character positions, or selection=true.
+                      anchor: str = "", expect: str = "", document: str = "") -> dict:
+    """Format text. Target: paragraph (to end_paragraph) or `anchor` (a paragraph's text), or every match
+    of `find` (or just `occurrence` N), or start+end character positions, or selection=true.
+    expect: start of the target paragraph's current text; refused if the document changed.
     Character: bold, italic, underline, strikethrough, font, size (pt), color (#RRGGBB),
     highlight (yellow, green, brightgreen, turquoise, pink, red, blue, gray25, none...).
     Paragraph: style, align (left/center/right/justify), space_after (pt), line_spacing (pt)."""
     def fn(app):
+        nonlocal paragraph
         d = get_doc(app, document)
+        if anchor or (expect and paragraph):
+            paragraph = locate(d, paragraph, anchor, expect)
         if highlight and highlight.lower() not in HIGHLIGHT:
             raise WordError(f"highlight must be one of {', '.join(HIGHLIGHT)}")
         if align and align.lower() not in ALIGN:
@@ -642,7 +819,7 @@ async def word_format(paragraph: int | None = None, end_paragraph: int | None = 
                 if highlight: r.HighlightColorIndex = HIGHLIGHT[highlight.lower()]
                 if para: apply_para(r.ParagraphFormat)
         return {"formatted_ranges": len(spans)}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -684,7 +861,7 @@ async def word_insert_table(rows: list[list[str]], after_paragraph: int = 0, hea
                 idx = i
                 break
         return {"table": idx, "rows": len(rows), "columns": cols}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -726,7 +903,7 @@ async def word_set_cell(table: int, row: int, column: int, text: str, document: 
         with undo_step(app, "set cell"):
             d.Tables(table).Cell(row, column).Range.Text = text
         return {"table": table, "row": row, "column": column}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -743,7 +920,7 @@ async def word_add_comment(comment: str, paragraph: int | None = None, find: str
         with undo_step(app, "comment"):
             c = d.Comments.Add(d.Range(a, b), comment)
         return {"n": c.Index, "comment_count": d.Comments.Count, "paragraph": para_index(d, a)}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 def get_comment(d, n: int):
@@ -763,7 +940,7 @@ async def word_list_comments(include_resolved: bool = True, document: str = "") 
     resolved state and its replies. `n` numbers are what the other comment tools take."""
     def fn(app):
         d = get_doc(app, document)
-        ctx = Context(d.WordOpenXML)  # one call for every comment, reply and resolved flag
+        ctx = get_context(d)  # one WordOpenXML read covers every comment, reply and resolved flag
         flat = ctx.comments()
         if len(flat) != d.Comments.Count:
             raise WordError("comment numbering mismatch between Word and its XML; retry")
@@ -793,7 +970,7 @@ async def word_reply_comment(n: int, text: str, document: str = "") -> dict:
         with undo_step(app, "reply"):
             r = root.Replies.Add(root.Range, text)
         return {"n": r.Index, "reply_to": comment_brief(root), "thread_replies": root.Replies.Count}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -807,7 +984,7 @@ async def word_resolve_comment(n: int, resolved: bool = True, document: str = ""
         with undo_step(app, "resolve comment"):
             root.Done = resolved
         return {"thread": comment_brief(root), "resolved": bool(root.Done)}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -819,7 +996,7 @@ async def word_edit_comment(n: int, text: str, document: str = "") -> dict:
         with undo_step(app, "edit comment"):
             c.Range.Text = text
         return comment_brief(c)
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -835,7 +1012,7 @@ async def word_delete_comment(n: int = 0, document: str = "") -> dict:
                 for i in range(d.Comments.Count, 0, -1):
                     d.Comments(i).Delete()
         return {"comment_count": d.Comments.Count}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 # --- whole-document context and images ---------------------------------------------
@@ -862,24 +1039,29 @@ def to_mcp_image(ctype: str, data: bytes, max_px: int) -> tuple[Image, dict]:
 
 @mcp.tool()
 async def word_context(start_paragraph: int = 1, max_chars: int = 60000, include_images: bool = False,
-                       max_images: int = 6, document: str = ""):
-    """Everything an agent needs to work on the document, in one call: stats, cursor, properties,
-    header/footer, the full body as markdown with Word paragraph numbers [pN] (headings, lists, tables,
-    bold/italic, links, tracked changes as {+ins+}/{-del-}, images as ![image n: alt]), every comment
-    thread with replies and resolved state, and footnotes.
+                       max_images: int = 6, stats: bool = True, refresh: bool = False, document: str = ""):
+    """READ THIS FIRST. Everything about the live document in one call (including the user's unsaved
+    typing): stats, cursor, save/AutoSave state, header/footer, the full body as markdown with Word paragraph
+    numbers [pN] (headings, lists, tables, bold/italic, links, tracked changes {+ins+}/{-del-}, images
+    ![image n: alt]), every comment thread with replies and resolved state, and footnotes.
+    Reuses its parse while the document is unchanged; refresh=true forces a re-read (e.g. after the user
+    only changed formatting). stats=false skips the page/word count (faster on very long documents).
     Long documents: continue with start_paragraph from the note at the end.
-    include_images=true also attaches the first max_images embedded images so you can see them."""
+    include_images=true attaches the first max_images embedded images so you can see them.
+    Afterwards word_changes reports only what changed since this read."""
     def fn(app):
         d = get_doc(app, document)
-        ctx = Context(d.WordOpenXML)
+        ctx = get_context(d, refresh)
         sel = app.Selection
         same_doc = app.ActiveDocument.FullName == d.FullName
-        word_paras = d.Paragraphs.Count
         info = {
-            "pages": d.ComputeStatistics(2), "words": d.ComputeStatistics(0), "paragraphs": word_paras,
-            "saved": bool(d.Saved), "track_changes": bool(d.TrackRevisions),
+            "pages": d.ComputeStatistics(2) if stats else None,
+            "words": d.ComputeStatistics(0) if stats else None,
+            "paragraphs": d.Paragraphs.Count, "saved": bool(d.Saved), "autosave": autosave_state(d),
+            "track_changes": bool(d.TrackRevisions),
             "cursor": (para_index(d, sel.Start), clean(sel.Text).strip()[:200]) if same_doc else None,
         }
+        take_snapshot(d)
         images = []
         if include_images:
             for meta in ctx.images[:max_images]:
@@ -888,21 +1070,24 @@ async def word_context(start_paragraph: int = 1, max_chars: int = 60000, include
                     images.append((meta, ctype, data))
                 except IndexError:
                     pass
-        return d.Name, d.FullName if d.Path else "", ctx, info, images
+        return d.Name, d.FullName, bool(d.Path), ctx, info, images
 
-    name, path, ctx, info, images = await worker.run(fn)
+    name, path, has_path, ctx, info, images = await worker.run(fn)
     body, next_para = ctx.render(start_paragraph, max_chars)
     comments = ctx.comments()
     threads = [c for c in comments if not c["reply_to"]]
     hf = ctx.headers_footers()
     props = ctx.properties()
-    out = [f"Document: {name}" + (f"  ({path})" if path else "  (never saved)")
-           + ("" if info["saved"] else "  - has unsaved changes")]
-    out.append(f"Pages {info['pages']}, words {info['words']}, paragraphs {info['paragraphs']}, tables {ctx.tables}, "
-               f"images {len(ctx.images)}, comment threads {len(threads)} "
-               f"({sum(not c['resolved'] for c in threads)} open), tracked changes "
-               f"{ctx.changes['ins']} insertions / {ctx.changes['del']} deletions"
-               + (", tracking ON" if info["track_changes"] else ""))
+    save_state = "saved" if info["saved"] else "UNSAVED changes (only the user decides when to save)"
+    if info["autosave"]:
+        save_state += ", AutoSave ON (edits upload automatically)"
+    out = [f"Document: {name}  ({path if has_path else 'never saved'})  - {save_state}"]
+    counts = [f"pages {info['pages']}, words {info['words']}" if info["pages"] is not None else "",
+              f"paragraphs {info['paragraphs']}", f"tables {ctx.tables}", f"images {len(ctx.images)}",
+              f"comment threads {len(threads)} ({sum(not c['resolved'] for c in threads)} open)",
+              f"tracked changes {ctx.changes['ins']} insertions / {ctx.changes['del']} deletions"
+              + (", tracking ON" if info["track_changes"] else "")]
+    out.append(", ".join(c for c in counts if c))
     if info["cursor"]:
         p, s = info["cursor"]
         out.append(f"Cursor: paragraph {p}" + (f', selected "{s}"' if s else ""))
@@ -913,18 +1098,16 @@ async def word_context(start_paragraph: int = 1, max_chars: int = 60000, include
             out.append(f"{kind.title()}: " + " | ".join(hf[kind]))
     if ctx.para != info["paragraphs"]:
         out.append(f"Note: paragraph numbers may drift (parsed {ctx.para}, Word reports {info['paragraphs']}); "
-                   "confirm with word_read before editing by number.")
+                   "prefer anchors, or confirm with word_read before editing by number.")
     out.append("")
-    out.append("--- body ([pN] = Word paragraph number, usable with the other word_* tools) ---")
+    out.append("--- body ([pN] = Word paragraph number; or target paragraphs by their text with `anchor`) ---")
     out.append(body if body else "(empty)")
     if next_para:
         out.append(f"... truncated: call word_context(start_paragraph={next_para}) for the rest")
     if comments:
         out.append("")
         out.append("--- comments (n = number for word_reply_comment / word_resolve_comment) ---")
-        for c in comments:
-            if c["reply_to"]:
-                continue
+        for c in threads:
             on = f' on "{c["on"][:80]}"' if c["on"] else ""
             where = f" (p{c['paragraph']})" if c["paragraph"] else ""
             state = " [resolved]" if c["resolved"] else ""
@@ -941,7 +1124,7 @@ async def word_context(start_paragraph: int = 1, max_chars: int = 60000, include
         out.append("")
         out.append("Images: " + "; ".join(f"{m['n']}: p{m['paragraph']} {m['alt_text'] or m['name']} "
                                           f"{m['width_cm']}x{m['height_cm']} cm" for m in ctx.images)
-                   + " - view with word_get_image(n) or word_page_image(page).")
+                   + " - view with word_get_image(n) or word_page_image(pages).")
     result: list = ["\n".join(out)]
     for meta, ctype, data in images:
         try:
@@ -953,13 +1136,130 @@ async def word_context(start_paragraph: int = 1, max_chars: int = 60000, include
 
 
 @mcp.tool()
+async def word_changes(document: str = "") -> dict:
+    """What changed since you last read the document (word_context / word_read / word_changes) that you did
+    not do yourself - typically the user's own edits: added, removed and changed paragraphs (with their
+    current numbers) plus image / comment / table / tracked-change counts. Much cheaper than re-reading.
+    The call also becomes the new baseline."""
+    def fn(app):
+        d = get_doc(app, document)
+        now = paragraph_texts(d)
+        counts = doc_counts(d)
+        base = SNAPSHOTS.get(d.FullName)
+        take_snapshot(d, now)
+        if base is None:
+            return {"baseline": "none yet - call word_context to read the document first; baseline taken now",
+                    "paragraph_count": len(now)}
+        import difflib
+        out = []
+        sm = difflib.SequenceMatcher(None, base["texts"], now, autojunk=False)
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op == "equal":
+                continue
+            item = {"type": {"replace": "changed", "insert": "added", "delete": "removed"}[op]}
+            if j2 > j1:
+                item["paragraphs"] = f"{j1 + 1}" if j2 - j1 == 1 else f"{j1 + 1}-{j2}"
+                item["now"] = [t[:300] for t in now[j1:j2][:20]]
+            else:
+                item["after_paragraph"] = j1
+            if i2 > i1:
+                item["before"] = [t[:300] for t in base["texts"][i1:i2][:20]]
+            out.append(item)
+            if len(out) >= 60:
+                out.append({"type": "truncated", "note": "many changes - re-read with word_context"})
+                break
+        delta = {k: {"before": base["counts"][k], "now": v} for k, v in counts.items() if base["counts"].get(k) != v}
+        return {"changed": bool(out or delta), "paragraph_count": len(now), "changes": out, "counts": delta,
+                "note": "paragraph numbers are current; formatting-only edits are not listed"}
+    return await worker.run(fn)
+
+
+@mcp.tool()
+async def word_insert_markdown(markdown: str, position: str = "end", paragraph: int = 0, anchor: str = "",
+                               expect: str = "", base_dir: str = "", document: str = "") -> dict:
+    """FASTEST way to write: a whole section (or document) of markdown in ONE call, typed straight into the
+    open document with its own styles. Supports # headings, paragraphs, **bold**, *italic*, ~~strike~~,
+    `inline code`, [links](https://...), - bullet / 1. numbered lists (nested; each list restarts at 1),
+    > quotes, ```fenced code blocks```, | pipe | tables |, --- rules, and images:
+    ![alt](C:/shots/ui.png "Caption text"){width=12cm}  - a local path (relative to base_dir), an https URL
+    or a data: URI; png/jpg/gif/svg/emf. The title in quotes becomes a numbered "Figure N:" caption.
+    Images wider than the page are fitted to the text width.
+    position: "end" | "start" | "after" / "before" (paragraph N or `anchor` text) | "section_end"
+    (end of the section under heading `anchor`) | "cursor" (after the paragraph holding the cursor).
+    Nothing is saved: the user decides when to save."""
+    def fn(app):
+        import md_to_word
+        t0 = time.perf_counter()
+        d = get_doc(app, document)
+        with undo_step(app, "insert markdown", freeze=True):
+            prepare_styles(d)
+            pos = new_paragraph_at(d, app, position, paragraph, anchor, expect)
+            frag = md_to_word.build(markdown, base_dir or os.getcwd(), usable_width_cm(d, pos))
+            end_before = d.Content.End
+            d.Range(pos, pos).InsertXML(frag.xml)
+            end = pos + (d.Content.End - end_before)
+            rng = d.Range(pos, end)
+            for marker, svg_path, width_cm, alt in frag.svg:  # SVGs go in natively, where XML could not
+                hits = find_ranges(d, marker, True, False, 1)
+                if not hits:
+                    frag.warnings.append(f"SVG placeholder for {svg_path} lost")
+                    continue
+                r = d.Range(*hits[0])
+                r.Text = ""
+                shp = d.InlineShapes.AddPicture(svg_path, False, True, r)
+                if shp.Width > 0:
+                    ratio = shp.Height / shp.Width
+                    shp.Width = width_cm * CM_TO_PT
+                    shp.Height = width_cm * CM_TO_PT * ratio
+                if alt:
+                    shp.AlternativeText = alt
+            if frag.captions:
+                d.Range(pos, pos + (d.Content.End - end_before)).Fields.Update()
+            end = pos + (d.Content.End - end_before)
+        return {"first_paragraph": para_index(d, pos), "last_paragraph": para_index(d, max(pos, end - 1)),
+                "paragraph_count": d.Paragraphs.Count, "headings": frag.headings, "tables": frag.tables,
+                "images": frag.images, "captions": frag.captions, "warnings": frag.warnings,
+                "ms": round((time.perf_counter() - t0) * 1000)}
+    return await worker.run(fn, edit=True)
+
+
+@mcp.tool()
+async def word_replace_section(anchor: str, markdown: str, keep_heading: bool = True, base_dir: str = "",
+                               document: str = "") -> dict:
+    """Rewrite one section: everything under heading `anchor` (up to the next heading of the same or a higher
+    level) is replaced by `markdown`, in one call. keep_heading=false replaces the heading too (then start
+    the markdown with the new heading). Sub-sections are part of the section and are replaced as well."""
+    def fn(app):
+        d = get_doc(app, document)
+        texts = paragraph_texts(d)
+        n = locate(d, None, anchor, "", texts)
+        end = section_end(d, n)
+        last = (end - 1) if end else len(texts)
+        first = n + 1 if keep_heading else n
+        removed = 0
+        with undo_step(app, "replace section", freeze=True):
+            if last >= first:
+                # Whole paragraphs; at the document end Word keeps one empty final paragraph,
+                # which the markdown then fills.
+                d.Range(d.Paragraphs(first).Range.Start, d.Paragraphs(last).Range.End).Delete()
+                removed = last - first + 1
+        # where the new content goes: before the next section's heading, or at the end
+        return {"heading_paragraph": n, "removed_paragraphs": removed,
+                "insert": ("before", first) if end else ("end", 0), "doc": d.FullName}
+    cut = await worker.run(fn, edit=True)
+    where, para = cut.pop("insert")
+    res = await word_insert_markdown(markdown, position=where, paragraph=para, base_dir=base_dir,
+                                     document=cut.pop("doc"))
+    return {**cut, **res}
+
+
+@mcp.tool()
 async def word_get_image(n: int, max_px: int = 1568, document: str = ""):
     """See embedded image n (numbering from word_context / word_list_images), at up to max_px pixels."""
     def fn(app):
         d = get_doc(app, document)
-        ctx = Context(d.WordOpenXML)
         try:
-            return ctx.image_bytes(n)
+            return get_context(d).image_bytes(n)
         except IndexError as e:
             raise WordError(str(e)) from None
     meta, ctype, data = await worker.run(fn)
@@ -971,15 +1271,33 @@ async def word_get_image(n: int, max_px: int = 1568, document: str = ""):
 async def word_list_images(document: str = "") -> dict:
     """Every embedded image and drawing: number, paragraph, alt text, size, inline or floating."""
     def fn(app):
-        ctx = Context(get_doc(app, document).WordOpenXML)
+        ctx = get_context(get_doc(app, document))
         return {"count": len(ctx.images), "images": ctx.images}
     return await worker.run(fn)
 
 
+def _page_list(pages: str, count: int) -> list[int]:
+    out: list[int] = []
+    for part in str(pages).replace(" ", "").split(","):
+        if not part:
+            continue
+        if part == "all":
+            out += range(1, count + 1)
+        elif "-" in part:
+            a, b = part.split("-", 1)
+            out += range(int(a or 1), min(int(b or count), count) + 1)
+        else:
+            out.append(int(part))
+    bad = [p for p in out if not 1 <= p <= count]
+    if bad:
+        raise WordError(f"page {bad[0]} out of range (document has {count})")
+    return out[:10]
+
+
 @mcp.tool()
-async def word_page_image(page: int = 1, dpi: int = 96, document: str = ""):
-    """See page N exactly as Word lays it out (text, tables, images, header/footer), as a PNG.
-    dpi 96 is screen size; raise it (up to 200) to read small print."""
+async def word_page_image(pages: str = "1", dpi: int = 96, document: str = ""):
+    """See pages exactly as Word lays them out (text, tables, images, header/footer), as PNGs.
+    pages: "1", "2-4", "1,3", "all" (max 10 per call). dpi 96 is screen size; up to 200 for small print."""
     def fn(app):
         d = get_doc(app, document)
         if d.Windows.Count == 0:
@@ -989,63 +1307,190 @@ async def word_page_image(page: int = 1, dpi: int = 96, document: str = ""):
         if view != 3:  # wdPrintView: pages only exist in Print Layout
             win.View.Type = 3
         try:
-            pages = win.Panes(1).Pages
-            count = pages.Count
-            if not 1 <= page <= count:
-                raise WordError(f"page {page} out of range (document has {count})")
-            return count, bytes(pages(page).EnhMetaFileBits)
+            pg = win.Panes(1).Pages
+            count = pg.Count
+            want = _page_list(pages, count)
+            return count, [(p, bytes(pg(p).EnhMetaFileBits)) for p in want]
         finally:
             if view != 3:
                 win.View.Type = view
-    count, emf = await worker.run(fn)
-    im = PILImage.open(io.BytesIO(emf))
-    im.load(dpi=max(48, min(dpi, 200)))
-    im = im.convert("RGB")
-    buf = io.BytesIO()
-    im.save(buf, "PNG", optimize=True)
-    return [json.dumps({"page": page, "pages": count, "pixels": list(im.size)}),
-            Image(data=buf.getvalue(), format="png")]
+    count, emfs = await worker.run(fn)
+    result: list = []
+    for p, emf in emfs:
+        im = PILImage.open(io.BytesIO(emf))
+        im.load(dpi=max(48, min(dpi, 200)))
+        im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, "PNG", optimize=True)
+        result += [json.dumps({"page": p, "pages": count, "pixels": list(im.size)}),
+                   Image(data=buf.getvalue(), format="png")]
+    return result
 
 
-@mcp.tool()
-async def word_insert_image(path: str, position: str = "end", paragraph: int = 0, width_cm: float | None = None,
-                            alt_text: str = "", document: str = "") -> dict:
-    """Insert a picture file (png, jpg, gif, bmp, svg, emf...) as its own paragraph.
-    position: "end" | "after" (paragraph N) | "before" (paragraph N) | "cursor". width_cm keeps the aspect ratio."""
-    def fn(app):
-        d = get_doc(app, document)
+def _image_file(path: str, data_base64: str, url: str) -> tuple[str, bool]:
+    """A local file for AddPicture from a path, base64 data or an http(s) URL; (path, is_temp)."""
+    import tempfile
+    import urllib.request
+    if path:
         full = os.path.abspath(path)
         if not os.path.isfile(full):
             raise WordError(f"file not found: {full}")
-        with undo_step(app, "insert image"):
-            if position == "cursor":
-                rng = app.Selection.Range
-            elif position in ("before", "after"):
-                count = check_para(d, paragraph)
-                if position == "after" and paragraph == count:
-                    pos, _ = _append(d, "")
+        return full, False
+    if data_base64:
+        head, _, b64 = data_base64.partition(",") if data_base64.startswith("data:") else ("", "", data_base64)
+        data = base64.b64decode(b64)
+        ext = ".svg" if b"<svg" in data[:300] else "." + (PILImage.open(io.BytesIO(data)).format or "png").lower()
+    elif url:
+        if not re.match(r"https?://", url, re.I):
+            raise WordError("url must be http(s)")
+        req = urllib.request.Request(url, headers={"User-Agent": "word-mcp"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            ctype = r.headers.get_content_type()
+            data = r.read(25 * 2**20 + 1)
+        if not ctype.startswith("image/") or len(data) > 25 * 2**20:
+            raise WordError(f"not an image under 25 MB ({ctype})")
+        ext = ".svg" if "svg" in ctype else "." + ctype.split("/")[1].split("+")[0]
+    else:
+        raise WordError("give path, data_base64 or url")
+    fd, tmp = tempfile.mkstemp(suffix=ext.replace("jpeg", "jpg"))
+    os.write(fd, data)
+    os.close(fd)
+    return tmp, True
+
+
+@mcp.tool()
+async def word_insert_image(path: str = "", data_base64: str = "", url: str = "", position: str = "end",
+                            paragraph: int = 0, anchor: str = "", expect: str = "", width_cm: float | None = None,
+                            alt_text: str = "", caption: str = "", replace: int = 0, document: str = "") -> dict:
+    """Put a picture in the document: a file `path` (png, jpg, gif, bmp, svg, emf - e.g. a screenshot or a
+    draw.io export), `data_base64` (raw or data: URI) or an https `url`.
+    Placed as its own centered paragraph at position "end" | "start" | "after" / "before" (paragraph N or
+    `anchor`) | "section_end" (end of the section under heading `anchor`) | "cursor".
+    replace=n swaps embedded image n (from word_context) in place, sized to fit the old picture's box
+    (an updated screenshot keeps its size) unless width_cm is given.
+    Without width_cm the picture keeps its natural size, fitted to the text width.
+    caption adds a numbered "Figure N: caption" line under it."""
+    def fn(app):
+        d = get_doc(app, document)
+        src, temp = _image_file(path, data_base64, url)
+        try:
+            with undo_step(app, "insert image"):
+                box = None
+                if replace:
+                    meta = get_context(d).images
+                    if not 1 <= replace <= len(meta):
+                        raise WordError(f"image {replace} does not exist (document has {len(meta)})")
+                    k = meta[replace - 1]["inline_index"]
+                    if not k:
+                        raise WordError(f"image {replace} is a floating shape; only inline images can be replaced")
+                    old = d.InlineShapes(k)
+                    rng, box = old.Range, (old.Width, old.Height)
+                    alt = alt_text or old.AlternativeText
+                    old.Delete()
                 else:
-                    pos = d.Paragraphs(paragraph + 1 if position == "after" else paragraph).Range.Start
-                    d.Range(pos, pos).InsertBefore("\r")
-                rng = d.Range(pos, pos)
-            elif position == "end":
-                pos, _ = _append(d, "")
-                rng = d.Range(pos, pos)
-            else:
-                raise WordError("position must be end, after, before or cursor")
-            if position != "cursor":
-                plain_paragraphs(d, rng.Start, rng.End)
-            shp = d.InlineShapes.AddPicture(full, False, True, rng)
-            if width_cm:
-                w0, h0 = shp.Width, shp.Height
-                shp.Width = width_cm * CM_TO_PT
-                shp.Height = h0 * (width_cm * CM_TO_PT) / w0
-            if alt_text:
-                shp.AlternativeText = alt_text
-            start = shp.Range.Start
+                    alt = alt_text
+                    pos = new_paragraph_at(d, app, position, paragraph, anchor, expect)
+                    rng = d.Range(pos, pos)
+                    rng.ParagraphFormat.Alignment = ALIGN["center"]
+                shp = d.InlineShapes.AddPicture(src, False, True, rng)
+                max_w = usable_width_cm(d, shp.Range.Start) * CM_TO_PT
+                if width_cm:
+                    target = width_cm * CM_TO_PT
+                elif box and shp.Width > 0 and shp.Height > 0:
+                    # fit inside the old picture's box: same size for an updated screenshot, no blow-up
+                    # when the new picture has another shape
+                    target = shp.Width * min(box[0] / shp.Width, box[1] / shp.Height)
+                else:
+                    target = min(shp.Width, max_w)
+                if shp.Width > 0 and abs(shp.Width - target) > 0.5:
+                    ratio = shp.Height / shp.Width
+                    shp.Width = target
+                    shp.Height = target * ratio
+                if alt:
+                    shp.AlternativeText = alt
+                if caption:
+                    shp.Range.InsertCaption("Figure", ": " + caption, "", 1)  # wdCaptionPositionBelow
+                start = shp.Range.Start
+        finally:
+            if temp:
+                try:
+                    os.remove(src)
+                except OSError:
+                    pass
         return {"paragraph": para_index(d, start), "width_cm": round(shp.Width / CM_TO_PT, 2),
-                "height_cm": round(shp.Height / CM_TO_PT, 2)}
+                "height_cm": round(shp.Height / CM_TO_PT, 2), "replaced": replace or None,
+                "caption": bool(caption)}
+    return await worker.run(fn, edit=True)
+
+
+@mcp.tool()
+async def word_insert_toc(position: str = "start", paragraph: int = 0, anchor: str = "", levels: int = 3,
+                          document: str = "") -> dict:
+    """Insert a table of contents built from the Heading styles (levels 1..levels), e.g. after the title:
+    position="after", anchor="<title text>". Refresh it later with word_update_fields."""
+    def fn(app):
+        d = get_doc(app, document)
+        with undo_step(app, "table of contents", freeze=True):
+            pos = new_paragraph_at(d, app, position, paragraph, anchor)
+            toc = d.TablesOfContents.Add(d.Range(pos, pos), True, 1, max(1, min(levels, 9)))
+            toc.Update()
+        return {"tables_of_contents": d.TablesOfContents.Count, "paragraph": para_index(d, pos)}
+    return await worker.run(fn, edit=True)
+
+
+@mcp.tool()
+async def word_update_fields(document: str = "") -> dict:
+    """Refresh every field: tables of contents, figure/caption numbers, cross-references, page numbers."""
+    def fn(app):
+        d = get_doc(app, document)
+        with undo_step(app, "update fields", freeze=True):
+            d.Fields.Update()
+            for i in range(1, d.TablesOfContents.Count + 1):
+                d.TablesOfContents(i).Update()
+        return {"fields": d.Fields.Count, "tables_of_contents": d.TablesOfContents.Count}
+    return await worker.run(fn, edit=True)
+
+
+@mcp.tool()
+async def word_autosave(on: bool | None = None, document: str = "") -> dict:
+    """Read (on=null) or set AutoSave for a SharePoint / OneDrive document. With AutoSave off, edits stay in
+    Word until the user saves (Ctrl+S). Local files have no AutoSave (null)."""
+    def fn(app):
+        d = get_doc(app, document)
+        if on is not None:
+            try:
+                d.AutoSaveOn = on
+            except pywintypes.com_error as e:
+                raise WordError("AutoSave cannot be changed for this document (local file or policy): "
+                                + com_message(e)) from None
+        return {"document": d.Name, "autosave": autosave_state(d), "saved": bool(d.Saved)}
     return await worker.run(fn)
+
+
+@mcp.tool()
+async def word_batch(calls: list[dict], stop_on_error: bool = True) -> dict:
+    """Run several word_* tools in ONE request (saves a model round trip per call):
+    calls = [{"tool": "word_insert_markdown", "args": {...}}, {"tool": "word_format", "args": {...}}, ...].
+    Runs in order; image results are summarised as text."""
+    results = []
+    for i, c in enumerate(calls):
+        name = c.get("tool", "")
+        fn = globals().get(name)
+        if not name.startswith("word_") or name == "word_batch" or not callable(fn):
+            results.append({"tool": name, "ok": False, "error": "unknown tool"})
+            if stop_on_error:
+                break
+            continue
+        try:
+            r = await fn(**(c.get("args") or {}))
+            if isinstance(r, list):
+                r = [x if isinstance(x, (str, dict)) else "<image>" for x in r]
+            results.append({"tool": name, "ok": True, "result": r})
+        except Exception as e:  # noqa: BLE001 - reported per call
+            results.append({"tool": name, "ok": False, "error": str(e)})
+            if stop_on_error:
+                break
+    return {"ran": len(results), "of": len(calls), "results": results}
 
 
 @mcp.tool()
@@ -1074,7 +1519,7 @@ async def word_track_changes(action: str = "status", document: str = "") -> dict
                               "text": clean(r.Range.Text), "paragraph": para_index(d, r.Range.Start)})
             out["list"] = items
         return out
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -1096,7 +1541,7 @@ async def word_header_footer(header: str | None = None, footer: str | None = Non
         s1 = d.Sections(1)
         return {"sections": d.Sections.Count, "header": clean(s1.Headers(1).Range.Text).strip(),
                 "footer": clean(s1.Footers(1).Range.Text).strip()}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -1125,7 +1570,7 @@ async def word_page_setup(orientation: str = "", margins_cm: float | None = None
                 "margins_cm": {k: round(getattr(ps, k + "Margin") / CM_TO_PT, 2)
                                for k in ("Top", "Bottom", "Left", "Right")},
                 "pages": d.ComputeStatistics(2)}  # wdStatisticPages
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
@@ -1149,7 +1594,7 @@ async def word_undo(times: int = 1, redo: bool = False, document: str = "") -> d
         d = get_doc(app, document)
         ok = d.Redo(times) if redo else d.Undo(times)
         return {"done": bool(ok), "paragraph_count": d.Paragraphs.Count}
-    return await worker.run(fn)
+    return await worker.run(fn, edit=True)
 
 
 _SEG = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?\s*$", re.S)
@@ -1211,7 +1656,7 @@ async def word_com(path: str, action: str = "get", value: Any = None, args: list
             with undo_step(app, m.group(1)):
                 return py_value(getattr(obj, m.group(1))(*(args or [])))
         raise WordError("action must be get, set or call")
-    return await worker.run(fn)
+    return await worker.run(fn, edit=action != "get")
 
 
 _api_cache: list | None = None

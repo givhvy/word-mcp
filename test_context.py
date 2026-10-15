@@ -173,7 +173,7 @@ async def scenario(s, doc, pic):
     li = await call(s, "word_list_images", **D)
     check(li["count"] == 1 and li["images"][0]["paragraph"] == 4, "word_list_images")
 
-    pg = await raw(s, "word_page_image", page=1, **D)
+    pg = await raw(s, "word_page_image", pages="1", **D)
     pim = [c for c in pg.content if c.type == "image"][0]
     with open(os.path.join(OUT, "context-test-page1.png"), "wb") as f:
         f.write(base64.b64decode(pim.data))

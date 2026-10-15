@@ -1,11 +1,20 @@
 # word-mcp
 
-An MCP server that lets an AI agent work inside the **Microsoft Word that is open on your Windows PC**:
-read the whole document with its structure, see its images and pages, write and format text, build
-tables, insert pictures, and hold comment conversations (add, reply, resolve), live, while you watch.
+An MCP server that lets an AI agent work inside the **Microsoft Word that is open on your Windows PC**,
+on local files and on SharePoint / OneDrive documents opened in Word desktop. The agent types straight
+into your open document while you watch: no closing, no reopening, no saving behind your back.
 
-It talks to Word through Word's own COM automation API, so everything happens in the real Word window,
-and every agent edit is a single Ctrl+Z step.
+Built for writing technical documents with an agent:
+- the agent reads your codebase and writes whole sections (headings, lists, code blocks, tables,
+  screenshots and diagrams with numbered captions) in **one call** with `word_insert_markdown`;
+- it reads the **whole live document**, including what you typed yourself and have not saved, with
+  its images and comments (`word_context`), and sees pages exactly as Word renders them;
+- it notices **your edits** since it last looked (`word_changes`) and targets places by heading text,
+  so your own writing and its writing can be mixed safely;
+- saving stays **your decision** (Ctrl+S): the agent never saves unless you ask.
+
+It uses Word's own COM automation API, so everything happens in the real Word window, and every
+agent edit is a single Ctrl+Z step.
 
 ## Requirements
 
@@ -67,6 +76,7 @@ If `python` is not on PATH for your client, use the full path to `python.exe`.
 ```powershell
 python -I test_word_mcp.py
 python -I test_context.py
+python -I test_v2.py
 ```
 
 Each test creates its own scratch documents in your open Word, checks every tool, and closes only what
@@ -74,57 +84,90 @@ it created. Both should end with `ALL CHECKS PASSED`.
 
 ## Guide for agents
 
-1. `word_status`: which documents are open and which is active.
-2. `word_context`: read the document before editing. It returns everything in one call:
-   - stats, cursor position, properties, header and footer
-   - the body as markdown, every line prefixed with Word's paragraph number `[pN]`. It shows headings
-     (`#`), lists, tables, bold and italic, links, tracked changes as `{-old-}{+new+}`, and images as
-     `![image n: alt text, WxH cm]`
-   - every comment thread with its replies and resolved state, plus footnotes
-   - `include_images=true` attaches the images. Long documents continue with `start_paragraph`.
-3. Edit by paragraph number (`word_insert`, `word_set_paragraph`, `word_format`, `word_delete_paragraphs`)
-   or by text (`word_find`, `word_replace`, `word_format(find=...)`).
-4. Paragraph numbers shift after inserting or deleting. Read again (`word_context` or `word_read`)
-   before the next edit that uses a number. Comment numbers `n` shift the same way after adding or
-   deleting comments.
-5. Check the layout with `word_page_image(page)`, which shows the page exactly as Word renders it.
-   Text output alone can miss layout problems.
-6. New paragraphs are Normal unless you pass `style` ("Heading 1", "Title", "List Bullet",
-   "List Number", ...). They never inherit a neighbouring heading or list.
-7. Every tool takes an optional `document` (name or full path); the default is the active document.
-8. Anything without a dedicated tool: `word_api_search` to look up Word's object model, then `word_com`
-   to get, set or call it. Example: path `ActiveDocument.Paragraphs(3).Range.Font.Size`.
+The server sends these rules to the agent on connect; they are repeated here.
 
-## Tools (35)
+1. **Read first**: `word_context` returns the whole live document in one call: stats, cursor, save state,
+   header/footer, the body as markdown with Word paragraph numbers `[pN]` (headings `#`, lists, tables,
+   bold/italic, links, code, tracked changes `{-old-}{+new+}`, images `![image n: alt, WxH cm]`), every
+   comment thread with replies, and footnotes. `include_images=true` attaches the images;
+   `word_page_image(pages="1-3")` shows rendered pages.
+2. **Write sections in one call** with `word_insert_markdown`:
+
+   ````markdown
+   ## Data flow
+
+   Requests go **client -> API -> DB**. See `api/routes.py`.
+
+   1. Auth checks the token
+      1. Validate signature
+   2. Handler runs
+
+   ```python
+   def handler(req): ...
+   ```
+
+   | Layer | Tech |
+   |---|---|
+   | API | FastAPI |
+
+   ![Architecture](C:/shots/arch.png "System architecture"){width=14cm}
+   ````
+
+   Images can be a local path (screenshots, draw.io exports), an https URL or a data: URI; png, jpg,
+   gif, svg, emf. The quoted title becomes a numbered "Figure N:" caption. Images are fitted to the
+   text width. Rewrite a section with `word_replace_section(anchor="Data flow", markdown=...)`.
+3. **Target by text, not just numbers**: `position="section_end", anchor="Components"` appends to a
+   section; `position="after", anchor="..."` inserts after any paragraph. When editing by number,
+   pass `expect` (the start of the paragraph's text): the edit is refused if the user changed it.
+4. **Before the next edit**, `word_changes` lists what the user changed since your last read (added,
+   removed and changed paragraphs with current numbers, image/comment counts). It is cheap; the
+   agent's own edits are not reported.
+5. **Never save** unless the user asks. `word_status`/`word_context` show the save and AutoSave state;
+   `word_autosave(false)` turns AutoSave off for a SharePoint/OneDrive document.
+6. Comments: `word_add_comment`, `word_reply_comment`, `word_resolve_comment`, `word_list_comments`.
+7. Several small steps at once: `word_batch`. Anything without a tool: `word_api_search` + `word_com`.
+
+## Tools (42)
 
 | Area | Tools |
 |---|---|
-| Context | `word_context` (whole document in one call), `word_status` |
-| See | `word_page_image` (a rendered page), `word_get_image` (an embedded image), `word_list_images` |
-| Documents | `word_new_document`, `word_open`, `word_save` (docx, pdf, rtf, txt, html, odt, ...), `word_close`, `word_activate` |
-| Read | `word_get_text`, `word_read` (paragraphs, optional styles), `word_find`, `word_read_tables` |
-| Edit | `word_insert` (start, end, before or after a paragraph, cursor; optional style), `word_set_paragraph`, `word_delete_paragraphs`, `word_replace`, `word_insert_table`, `word_set_cell`, `word_insert_image`, `word_undo` |
-| Format | `word_format` (bold, italic, underline, strikethrough, font, size, color, highlight, style, alignment, spacing; targets a paragraph range, every match of a text, a character range or the selection), `word_page_setup`, `word_header_footer` |
-| Comments | `word_add_comment`, `word_reply_comment`, `word_list_comments` (threads), `word_resolve_comment`, `word_edit_comment`, `word_delete_comment` |
-| Review | `word_track_changes` (on, off, list, accept all, reject all) |
-| Navigate | `word_select` (moves Word's cursor and scrolls to it) |
-| Escape hatch | `word_com`, `word_api_search` |
+| Read | `word_context` (whole document), `word_changes` (what the user changed), `word_status`, `word_read`, `word_get_text`, `word_find`, `word_read_tables` |
+| See | `word_page_image` (rendered pages), `word_get_image`, `word_list_images` |
+| Write | `word_insert_markdown` (whole sections), `word_replace_section`, `word_insert` (plain text), `word_set_paragraph`, `word_delete_paragraphs`, `word_replace`, `word_insert_table`, `word_set_cell`, `word_undo` |
+| Images | `word_insert_image` (path, base64 or URL; caption; replace an image in place) |
+| Format | `word_format`, `word_page_setup`, `word_header_footer`, `word_insert_toc`, `word_update_fields` |
+| Comments | `word_add_comment`, `word_reply_comment`, `word_list_comments`, `word_resolve_comment`, `word_edit_comment`, `word_delete_comment` |
+| Review | `word_track_changes` |
+| Documents | `word_new_document`, `word_open` (path or SharePoint/OneDrive URL), `word_save`, `word_close`, `word_activate`, `word_autosave`, `word_select` |
+| Other | `word_batch`, `word_com`, `word_api_search` |
 
 ## How it works
 
-- `word_mcp_server.py` (FastMCP, stdio). One dedicated COM thread owns every Word object. It attaches
-  to the running Word, retries while Word is busy, and reconnects if Word restarts.
-- `docx_context.py` reads `Document.WordOpenXML`, the whole document package in a single COM call,
-  and parses it. That is how `word_context`, the comment threads and the images stay fast on
-  large documents: about 20-40 ms for the read instead of one round trip per paragraph.
-- Bulk edits use Word's own engine: Find/Replace with formatting for "format every match", and
-  text-to-table conversion for tables. Each is one call instead of one per item.
+- `word_mcp_server.py` (FastMCP, stdio). One dedicated COM thread owns every Word object; it attaches to
+  the running Word, retries while Word is busy, and reconnects if Word restarts.
+- `md_to_word.py` turns markdown into a WordprocessingML fragment that Word imports with
+  `Range.InsertXML`: a whole section, images included, in one call, using the document's own styles.
+- `docx_context.py` reads `Document.WordOpenXML` (the whole document in one call) and turns it into
+  the markdown view, comment threads and image list. The parse is cached and reused while the document
+  is unchanged; images are decoded only when asked for.
+- `word_changes` keeps a per-document snapshot of what the agent last saw, refreshed after the agent's
+  own edits, and diffs the live paragraphs against it.
 - `dump_typelib.ps1` decodes Word's type library (`MSWORD.OLB`, found through the registry) into
-  `word-api.json`. `word_api_search` builds it automatically on first use (about 2 s).
+  `word-api.json` for `word_api_search`; built automatically on first use (about 2 s).
 
-Typical speed: simple reads about 10 ms. Edits take 35-150 ms, depending on how busy Word is
-(layout and spell-check of visible documents). Whole-document context 0.15-0.2 s, page image about
-0.7 s, replace or format 500 matches 0.15-0.4 s.
+Measured on Word 16 (Microsoft 365), typical desktop:
+
+| Operation | Time |
+|---|---|
+| Write a section (headings, nested lists, code block, table, 2 images with captions) | 0.3-0.75 s, one call |
+| Write 40 sections with 40 full-width screenshots | 1.0 s, one call |
+| Read a 360-paragraph document with 40 images (`word_context`) | 0.24 s first read, 0.1 s when unchanged |
+| `word_changes` on that document | 70 ms |
+| Simple tool calls | 10-150 ms depending on how busy Word is |
+| Page image | 0.2-0.7 s |
+
+The largest cost in practice is the number of agent turns, not Word: prefer `word_insert_markdown`
+and `word_batch` over many small calls.
 
 ## Troubleshooting
 
@@ -140,6 +183,10 @@ Typical speed: simple reads about 10 ms. Edits take 35-150 ms, depending on how 
 ## Limitations
 
 - Windows and Word desktop only, because it uses COM automation.
-- Works on the main document body. Headers and footers can be set, and are shown read-only in
-  `word_context`. Text boxes are shown in context but are not edited by the dedicated tools; use `word_com`.
+- Works on the main document body. Headers and footers can be set, and are shown in `word_context`.
+  Text boxes are shown in context but are not edited by the dedicated tools; use `word_com`.
+- `word_changes` and the context cache see text, image, comment and tracked-change edits; a user's
+  formatting-only change is picked up with `word_context(refresh=true)`.
+- SharePoint / OneDrive: open the document in Word desktop (not in the browser). `word_open` takes the
+  file's direct URL; sharing links (`/:w:/...`) may not open through COM.
 - Page images do not show comment balloons. Read comments with `word_list_comments`.

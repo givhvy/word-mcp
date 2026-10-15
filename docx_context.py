@@ -54,7 +54,7 @@ class Piece:
 @dataclass
 class Package:
     parts: dict = field(default_factory=dict)      # name -> Element (xml parts)
-    binary: dict = field(default_factory=dict)     # name -> (content_type, bytes)
+    binary: dict = field(default_factory=dict)     # name -> (content_type, base64 text)
 
     @classmethod
     def parse(cls, flat_xml: str) -> "Package":
@@ -69,7 +69,7 @@ class Package:
                 continue
             bd = part.find(q("pkg:binaryData"))
             if bd is not None and bd.text:
-                pkg.binary[name] = (part.get(q("pkg:contentType"), ""), base64.b64decode(bd.text))
+                pkg.binary[name] = (part.get(q("pkg:contentType"), ""), bd.text)  # base64, decoded on demand
         return pkg
 
     def rels(self, part: str) -> dict:
@@ -105,6 +105,8 @@ class Context:
         self.counters: dict = {}
         self.changes = {"ins": 0, "del": 0}
         self.lines: list[tuple[int, str]] = []      # (paragraph number, rendered line)
+        self.heading_level: dict[int, int] = {}     # paragraph number -> 1..9 (Title = 0)
+        self.inline_images = 0
         self.para = 0
         self.tables = 0
         self._render_body()
@@ -217,7 +219,9 @@ class Context:
         m = re.match(r"heading (\d)", low)
         if m:
             prefix = "#" * int(m.group(1)) + " "
+            self.heading_level[n] = int(m.group(1))
         elif low == "title":
+            self.heading_level[n] = 0
             prefix = "# "
         elif numpr is not None:
             nid = numpr.find(W("numId"))
@@ -390,9 +394,12 @@ class Context:
     def _image(self, part, alt, name, w_cm, h_cm, floating, para) -> str:
         ctype = self.pkg.binary.get(part, ("", b""))[0]
         k = len(self.images) + 1
+        if not floating:
+            self.inline_images += 1
         self.images.append({"n": k, "part": part, "content_type": ctype, "alt_text": alt, "name": name,
                             "width_cm": round(w_cm, 2), "height_cm": round(h_cm, 2),
-                            "floating": floating, "paragraph": para})
+                            "floating": floating, "paragraph": para,
+                            "inline_index": None if floating else self.inline_images})
         desc = alt or name or part.rsplit("/", 1)[-1]
         size = f", {w_cm:.1f}x{h_cm:.1f} cm" if w_cm else ""
         return f"![image {k}: {desc}{size}{', floating' if floating else ''}]"
@@ -486,10 +493,10 @@ class Context:
         if not 1 <= n <= len(self.images):
             raise IndexError(f"image {n} does not exist (document has {len(self.images)})")
         meta = self.images[n - 1]
-        ctype, data = self.pkg.binary.get(meta["part"], ("", b""))
+        ctype, data = self.pkg.binary.get(meta["part"], ("", ""))
         if not data:
             raise IndexError(f"image {n} has no embedded data (linked picture?)")
-        return meta, ctype, data
+        return meta, ctype, base64.b64decode(data)
 
     # --- output ------------------------------------------------------------------
     def render(self, start_paragraph: int = 1, max_chars: int = 60000) -> tuple[str, int | None]:
