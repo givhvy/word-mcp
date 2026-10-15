@@ -149,6 +149,9 @@ mcp = FastMCP("word", log_level="WARNING", instructions=(
     "word_replace_section. 3) Target places by `anchor` (a heading's or paragraph's text) rather than numbers "
     "when the user may be editing too; pass `expect` with numbers. 4) Before further edits, word_changes "
     "shows what the user changed since your last read (cheap). 5) Check layout with word_page_image.\n"
+    "Styling: new content automatically follows the document's HOUSE STYLE (its own heading, body, list, "
+    "table, code and caption styles, company templates included) - word_styles shows it; use plain markdown "
+    "and do not add direct formatting. word_apply_styles copies styles from a template file.\n"
     "NEVER save (word_save / word_close save=true) unless the user explicitly asks: saving is the user's "
     "decision (they press Ctrl+S). Every edit is one Ctrl+Z step. Several small steps: word_batch.\n"
     "Anything without a tool: word_api_search + word_com (full Word object model). Most tools take an "
@@ -461,6 +464,43 @@ def usable_width_cm(d, pos: int) -> float:
     return max(4.0, (ps.PageWidth - ps.LeftMargin - ps.RightMargin) / CM_TO_PT)
 
 
+HOUSE_ROLES = ("heading1", "heading2", "heading3", "heading4", "heading5", "heading6", "title", "body",
+               "bullet", "number", "table", "table_text", "code", "inline_code", "quote", "caption", "figure",
+               "caption_label")
+
+
+def house_for(d, mode: str = "auto", overrides: dict | None = None) -> dict:
+    """The styles new content should use. mode "auto": detected from the document (its own headings,
+    body text, lists, tables, code, captions); "builtin": Word's standard styles. overrides maps a role
+    (heading1..6, title, body, bullet, number, table, table_text, code, inline_code, quote, caption,
+    figure, caption_label) to a style name that must exist in the document."""
+    if mode not in ("auto", "builtin"):
+        raise WordError('styles must be "auto" or "builtin"')
+    ctx = get_context(d)
+    house = ctx.house_style() if mode == "auto" else {}
+    ids = {v.lower(): k for k, v in ctx.style_name.items()}
+    for role, name in (overrides or {}).items():
+        if role not in HOUSE_ROLES:
+            raise WordError(f"unknown style role {role!r}; roles: {', '.join(HOUSE_ROLES)}")
+        if role == "caption_label":
+            house[role] = str(name)
+            continue
+        try:
+            st = d.Styles(name)
+        except pywintypes.com_error:
+            raise WordError(f"style {name!r} does not exist in the document; see word_styles") from None
+        st.Priority = st.Priority  # instantiate a latent built-in so the document defines it
+        sid = ids.get(st.NameLocal.lower()) or re.sub(r"[^A-Za-z0-9]", "", st.NameLocal)
+        entry = {"id": sid, "name": st.NameLocal, "source": "override", "custom": not st.BuiltIn}
+        if role in ("bullet", "number"):
+            try:
+                entry["style_numbering"] = st.ListTemplate is not None
+            except pywintypes.com_error:
+                entry["style_numbering"] = False
+        house[role] = entry
+    return house
+
+
 def autosave_state(d):
     try:
         return bool(d.AutoSaveOn)
@@ -640,7 +680,8 @@ async def word_insert(text: str, position: str = "end", paragraph: int = 0, anch
     section under heading `anchor`) | "cursor" (typed at the selection, inline).
     anchor: text of the target paragraph (e.g. a heading) - robust when the user edits the document too.
     expect: start of paragraph N's current text; the edit is refused if it no longer matches.
-    style applies a paragraph style ("Heading 1", "List Bullet", ...); without it new paragraphs are Normal."""
+    style applies a paragraph style ("Heading 1", "List Bullet", ...); without it new paragraphs take the
+    document's own body text style (house style, see word_styles)."""
     def fn(app):
         d = get_doc(app, document)
         body = to_word(text)
@@ -651,11 +692,14 @@ async def word_insert(text: str, position: str = "end", paragraph: int = 0, anch
                 a, b = r.Start, r.End
                 app.Selection.SetRange(b, b)
             else:
+                house_body = None if style else get_context(d).house_style().get("body", {}).get("name")
                 a = new_paragraph_at(d, app, position, paragraph, anchor, expect)
                 d.Range(a, a).InsertAfter(body)
                 b = a + len(body)
                 if style:
                     d.Range(a, b).Style = resolve_style(d, style)
+                elif house_body and house_body != "Normal":  # the document's own body text style
+                    d.Range(a, b).Style = d.Styles(house_body)
         return {"first_paragraph": para_index(d, a), "last_paragraph": para_index(d, b),
                 "paragraph_count": d.Paragraphs.Count}
     return await worker.run(fn, edit=True)
@@ -824,13 +868,17 @@ async def word_format(paragraph: int | None = None, end_paragraph: int | None = 
 
 @mcp.tool()
 async def word_insert_table(rows: list[list[str]], after_paragraph: int = 0, header: bool = True,
-                            style: str = "Table Grid", autofit: bool = True, document: str = "") -> dict:
+                            style: str = "auto", autofit: bool = True, document: str = "") -> dict:
     """Insert a table from a 2D list of cell strings (first row = header when header=true).
-    Placed after paragraph N, or at the end when after_paragraph=0."""
+    Placed after paragraph N, or at the end when after_paragraph=0.
+    style "auto" uses the document's own table style (house style; Table Grid if it has none)."""
     def fn(app):
+        nonlocal style
         if not rows or not rows[0]:
             raise WordError("rows must be a non-empty 2D list")
         d = get_doc(app, document)
+        if style == "auto":
+            style = get_context(d).house_style().get("table", {}).get("name", "Table Grid")
         cols = max(len(r) for r in rows)
         cell = lambda v: str(v).replace("\t", " ").replace("\r", " ").replace("\n", " ")
         body = "\r".join("\t".join(cell(v) for v in (r + [""] * (cols - len(r)))) for r in rows)
@@ -852,7 +900,8 @@ async def word_insert_table(rows: list[list[str]], after_paragraph: int = 0, hea
                     pass
             if header:
                 t.Rows(1).HeadingFormat = True
-                t.Rows(1).Range.Font.Bold = True
+                if style.lower() == "table grid":  # a house table style formats its own header row
+                    t.Rows(1).Range.Font.Bold = True
             if autofit:
                 t.AutoFitBehavior(1)  # wdAutoFitContent
         idx = 0
@@ -1096,6 +1145,13 @@ async def word_context(start_paragraph: int = 1, max_chars: int = 60000, include
     for kind in ("header", "footer"):
         if hf[kind]:
             out.append(f"{kind.title()}: " + " | ".join(hf[kind]))
+    house = ctx.house_style()
+    parts = [f"{label} {house[r]['name']}" for r, label in
+             (("heading1", "heading 1:"), ("heading2", "heading 2:"), ("body", "body:"), ("bullet", "bullets:"),
+              ("number", "numbers:"), ("table", "tables:"), ("code", "code:"), ("caption", "captions:"))
+             if isinstance(house.get(r), dict)]
+    out.append("House style (new content follows it; details: word_styles): " + ", ".join(parts)
+               + f", caption label '{house.get('caption_label', 'Figure')}'")
     if ctx.para != info["paragraphs"]:
         out.append(f"Note: paragraph numbers may drift (parsed {ctx.para}, Word reports {info['paragraphs']}); "
                    "prefer anchors, or confirm with word_read before editing by number.")
@@ -1176,7 +1232,8 @@ async def word_changes(document: str = "") -> dict:
 
 @mcp.tool()
 async def word_insert_markdown(markdown: str, position: str = "end", paragraph: int = 0, anchor: str = "",
-                               expect: str = "", base_dir: str = "", document: str = "") -> dict:
+                               expect: str = "", base_dir: str = "", styles: str = "auto",
+                               style_overrides: dict | None = None, document: str = "") -> dict:
     """FASTEST way to write: a whole section (or document) of markdown in ONE call, typed straight into the
     open document with its own styles. Supports # headings, paragraphs, **bold**, *italic*, ~~strike~~,
     `inline code`, [links](https://...), - bullet / 1. numbered lists (nested; each list restarts at 1),
@@ -1186,15 +1243,20 @@ async def word_insert_markdown(markdown: str, position: str = "end", paragraph: 
     Images wider than the page are fitted to the text width.
     position: "end" | "start" | "after" / "before" (paragraph N or `anchor` text) | "section_end"
     (end of the section under heading `anchor`) | "cursor" (after the paragraph holding the cursor).
+    styles "auto" (default) follows the document's HOUSE STYLE: its own heading, body, list, table,
+    table-text, code, quote, caption and figure styles and its list formats, as listed by word_styles
+    (company templates included). "builtin" uses Word's standard styles. style_overrides pins roles to
+    named styles, e.g. {"table": "Company Table", "body": "Body Text", "caption_label": "Fig."}.
     Nothing is saved: the user decides when to save."""
     def fn(app):
         import md_to_word
         t0 = time.perf_counter()
         d = get_doc(app, document)
+        house = house_for(d, styles, style_overrides)
         with undo_step(app, "insert markdown", freeze=True):
             prepare_styles(d)
             pos = new_paragraph_at(d, app, position, paragraph, anchor, expect)
-            frag = md_to_word.build(markdown, base_dir or os.getcwd(), usable_width_cm(d, pos))
+            frag = md_to_word.build(markdown, base_dir or os.getcwd(), usable_width_cm(d, pos), house)
             end_before = d.Content.End
             d.Range(pos, pos).InsertXML(frag.xml)
             end = pos + (d.Content.End - end_before)
@@ -1216,15 +1278,17 @@ async def word_insert_markdown(markdown: str, position: str = "end", paragraph: 
             if frag.captions:
                 d.Range(pos, pos + (d.Content.End - end_before)).Fields.Update()
             end = pos + (d.Content.End - end_before)
+        used = {r: house[r]["name"] for r in ("heading1", "body", "bullet", "table", "code") if isinstance(house.get(r), dict)}
         return {"first_paragraph": para_index(d, pos), "last_paragraph": para_index(d, max(pos, end - 1)),
                 "paragraph_count": d.Paragraphs.Count, "headings": frag.headings, "tables": frag.tables,
                 "images": frag.images, "captions": frag.captions, "warnings": frag.warnings,
-                "ms": round((time.perf_counter() - t0) * 1000)}
+                "house_style": used, "ms": round((time.perf_counter() - t0) * 1000)}
     return await worker.run(fn, edit=True)
 
 
 @mcp.tool()
 async def word_replace_section(anchor: str, markdown: str, keep_heading: bool = True, base_dir: str = "",
+                               styles: str = "auto", style_overrides: dict | None = None,
                                document: str = "") -> dict:
     """Rewrite one section: everything under heading `anchor` (up to the next heading of the same or a higher
     level) is replaced by `markdown`, in one call. keep_heading=false replaces the heading too (then start
@@ -1249,8 +1313,66 @@ async def word_replace_section(anchor: str, markdown: str, keep_heading: bool = 
     cut = await worker.run(fn, edit=True)
     where, para = cut.pop("insert")
     res = await word_insert_markdown(markdown, position=where, paragraph=para, base_dir=base_dir,
-                                     document=cut.pop("doc"))
+                                     styles=styles, style_overrides=style_overrides, document=cut.pop("doc"))
     return {**cut, **res}
+
+
+@mcp.tool()
+async def word_styles(document: str = "") -> dict:
+    """The document's HOUSE STYLE - which style it uses for each kind of content (heading levels, body
+    text, bullets, numbered lists, tables, table text, code, quotes, captions and their label, figures),
+    detected from the document itself and from the styles its template defines. word_insert_markdown,
+    word_insert and word_insert_table follow it automatically. Also lists the styles in use and the
+    template's own (custom) styles with their font/size/colour, to pick from for style_overrides."""
+    def fn(app):
+        d = get_doc(app, document)
+        ctx = get_context(d)
+        house = ctx.house_style()
+        roles = {}
+        for role, v in house.items():
+            if role == "caption_label":
+                roles[role] = v
+            else:
+                item = {"style": v["name"], "from": {"used": "used in the document", "template": "template style",
+                                                      "builtin": "Word default"}.get(v["source"], v["source"])}
+                if v.get("abstract_xml"):
+                    item["list_format"] = "copied from the document's own lists"
+                roles[role] = item
+        try:
+            template = d.AttachedTemplate.FullName
+        except pywintypes.com_error:
+            template = None
+        return {"document": d.Name, "template": template, "house_style": roles, "styles": ctx.style_catalog()[:80]}
+    return await worker.run(fn)
+
+
+@mcp.tool()
+async def word_apply_styles(source: str, document: str = "") -> dict:
+    """Copy all styles from a template or styled document into this document, so its headings, body,
+    lists and tables take the template's look (existing text restyles automatically).
+    source: a .dotx/.dotm/.docx path, a SharePoint/OneDrive URL, or the name of another open, saved document."""
+    def fn(app):
+        d = get_doc(app, document)
+        src = source.strip()
+        for i in range(1, app.Documents.Count + 1):
+            o = app.Documents(i)
+            if src.lower() in (o.Name.lower(), o.FullName.lower()):
+                if not o.Path:
+                    raise WordError(f"{o.Name} was never saved; save it (or the template) to a file first")
+                src = o.FullName
+                break
+        else:
+            if not re.match(r"https?://", src, re.I):
+                src = os.path.abspath(src)
+                if not os.path.isfile(src):
+                    raise WordError(f"file not found: {src}")
+        with undo_step(app, "apply styles", freeze=True):
+            d.CopyStylesFromTemplate(src)
+        STYLES_READY.discard(d.FullName)
+        CTX_CACHE.pop(d.FullName, None)
+        house = get_context(d).house_style()
+        return {"applied_from": src, "house_style": {k: (v if isinstance(v, str) else v["name"]) for k, v in house.items()}}
+    return await worker.run(fn, edit=True)
 
 
 @mcp.tool()

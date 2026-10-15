@@ -11,6 +11,8 @@ Built for writing technical documents with an agent:
   its images and comments (`word_context`), and sees pages exactly as Word renders them;
 - it notices **your edits** since it last looked (`word_changes`) and targets places by heading text,
   so your own writing and its writing can be mixed safely;
+- everything it writes follows the document's **house style**: your template's own heading, body,
+  list, table, code and caption styles (detected from the document, or copied from a template file);
 - saving stays **your decision** (Ctrl+S): the agent never saves unless you ask.
 
 It uses Word's own COM automation API, so everything happens in the real Word window, and every
@@ -77,6 +79,7 @@ If `python` is not on PATH for your client, use the full path to `python.exe`.
 python -I test_word_mcp.py
 python -I test_context.py
 python -I test_v2.py
+python -I test_styles.py
 ```
 
 Each test creates its own scratch documents in your open Word, checks every tool, and closes only what
@@ -122,12 +125,37 @@ The server sends these rules to the agent on connect; they are repeated here.
 4. **Before the next edit**, `word_changes` lists what the user changed since your last read (added,
    removed and changed paragraphs with current numbers, image/comment counts). It is cheap; the
    agent's own edits are not reported.
-5. **Never save** unless the user asks. `word_status`/`word_context` show the save and AutoSave state;
+5. **Styling is automatic**: new content follows the document's house style (see below). Write plain
+   markdown and do not add direct formatting. `word_styles` shows which styles will be used.
+6. **Never save** unless the user asks. `word_status`/`word_context` show the save and AutoSave state;
    `word_autosave(false)` turns AutoSave off for a SharePoint/OneDrive document.
-6. Comments: `word_add_comment`, `word_reply_comment`, `word_resolve_comment`, `word_list_comments`.
-7. Several small steps at once: `word_batch`. Anything without a tool: `word_api_search` + `word_com`.
+7. Comments: `word_add_comment`, `word_reply_comment`, `word_resolve_comment`, `word_list_comments`.
+8. Several small steps at once: `word_batch`. Anything without a tool: `word_api_search` + `word_com`.
 
-## Tools (42)
+## House style (company templates)
+
+Everything the agent writes uses the document's own styles, detected from the document itself:
+
+| Role | Detected from |
+|---|---|
+| Headings 1-6 | styles used for headings, including custom ones (any style with an outline level, e.g. "Company Heading 1") |
+| Body text | the most used plain paragraph style (e.g. "Body Text", "Company Body") |
+| Bullets / numbered lists | the style **and the list format** (bullet glyph, numbering, indents) of existing lists |
+| Tables, table text | the table style of existing tables (its own header row formatting) and the cell paragraph style |
+| Code, inline code, quotes | styles named like code / source / listing, quote |
+| Captions | the caption style and label in use ("Figure", "Fig", "Abbildung", ...) |
+| Pictures | the paragraph style of existing image paragraphs |
+
+If a role is not used yet, a matching style defined by the document's template is used; otherwise
+Word's built-in style. Nothing is copied or duplicated: Word applies the document's own definitions.
+
+- `word_styles` shows the detected house style plus the template's custom styles (font, size, colour).
+- `word_apply_styles(source)` copies all styles from a `.dotx`/`.docx` template, a SharePoint URL or
+  another open document, so a blank document takes the company look.
+- `word_insert_markdown(..., style_overrides={"table": "Company Table", "caption_label": "Fig."})`
+  pins roles; `styles="builtin"` ignores the house style.
+
+## Tools (44)
 
 | Area | Tools |
 |---|---|
@@ -135,7 +163,7 @@ The server sends these rules to the agent on connect; they are repeated here.
 | See | `word_page_image` (rendered pages), `word_get_image`, `word_list_images` |
 | Write | `word_insert_markdown` (whole sections), `word_replace_section`, `word_insert` (plain text), `word_set_paragraph`, `word_delete_paragraphs`, `word_replace`, `word_insert_table`, `word_set_cell`, `word_undo` |
 | Images | `word_insert_image` (path, base64 or URL; caption; replace an image in place) |
-| Format | `word_format`, `word_page_setup`, `word_header_footer`, `word_insert_toc`, `word_update_fields` |
+| Format | `word_styles` (house style), `word_apply_styles` (from a template), `word_format`, `word_page_setup`, `word_header_footer`, `word_insert_toc`, `word_update_fields` |
 | Comments | `word_add_comment`, `word_reply_comment`, `word_list_comments`, `word_resolve_comment`, `word_edit_comment`, `word_delete_comment` |
 | Review | `word_track_changes` |
 | Documents | `word_new_document`, `word_open` (path or SharePoint/OneDrive URL), `word_save`, `word_close`, `word_activate`, `word_autosave`, `word_select` |

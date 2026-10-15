@@ -24,6 +24,9 @@ NS = {
     "dcterms": "http://purl.org/dc/terms/",
 }
 EMU_PER_CM = 360000
+for _p, _u in NS.items():  # serialize copied XML (list definitions) with the usual prefixes
+    if _p not in ("rel",):
+        ET.register_namespace(_p, _u)
 
 
 def q(tag: str) -> str:
@@ -109,11 +112,21 @@ class Context:
         self.inline_images = 0
         self.para = 0
         self.tables = 0
+        self.para_meta: list[dict] = []             # per paragraph: style id, role facts (house style)
+        self.table_styles: list[str] = []           # style id of each top-level table
+        self.char_styles: dict[str, int] = {}       # character style id -> uses
         self._render_body()
+        self.seq_labels: dict[str, int] = {}        # caption labels in use (SEQ Figure, SEQ Table...)
+        for el in self.doc.iter():
+            instr = el.get(W("instr")) if el.tag == W("fldSimple") else (el.text if el.tag == W("instrText") else None)
+            m = re.search(r"SEQ\s+(\S+)", instr or "")
+            if m:
+                self.seq_labels[m.group(1)] = self.seq_labels.get(m.group(1), 0) + 1
 
     # --- styles / numbering ----------------------------------------------------
     def _load_styles(self):
         self.style_name, self.style_based, self.style_num = {}, {}, {}
+        self.style_type, self.style_custom, self.style_outline, self.style_look = {}, set(), {}, {}
         st = self.pkg.parts.get("/word/styles.xml")
         if st is None:
             return
@@ -121,12 +134,59 @@ class Context:
             sid = s.get(W("styleId"))
             n = s.find(W("name"))
             self.style_name[sid] = n.get(W("val")) if n is not None else sid
+            self.style_type[sid] = s.get(W("type"), "paragraph")
+            if s.get(W("customStyle")) in ("1", "true"):
+                self.style_custom.add(sid)
             b = s.find(W("basedOn"))
             if b is not None:
                 self.style_based[sid] = b.get(W("val"))
             num = s.find(f"{W('pPr')}/{W('numPr')}")
             if num is not None:
                 self.style_num[sid] = num
+            ol = s.find(f"{W('pPr')}/{W('outlineLvl')}")
+            if ol is not None:
+                self.style_outline[sid] = int(ol.get(W("val"), "9"))
+            rpr = s.find(W("rPr"))
+            if rpr is not None:
+                look = {}
+                f = rpr.find(W("rFonts"))
+                if f is not None and (f.get(W("ascii")) or f.get(W("asciiTheme"))):
+                    look["font"] = f.get(W("ascii")) or f.get(W("asciiTheme"))
+                sz = rpr.find(W("sz"))
+                if sz is not None:
+                    look["size_pt"] = int(sz.get(W("val"), "0")) / 2
+                c = rpr.find(W("color"))
+                if c is not None and c.get(W("val")) not in (None, "auto"):
+                    look["color"] = "#" + c.get(W("val"))
+                if on(rpr, "b"):
+                    look["bold"] = True
+                if look:
+                    self.style_look[sid] = look
+
+    def heading_level_of(self, sid) -> int | None:
+        """1-9 for heading styles: built-in "heading N" or any style with an outline level
+        (a company's own heading styles), following basedOn."""
+        seen = set()
+        while sid and sid not in seen:
+            seen.add(sid)
+            m = re.match(r"heading (\d)$", self.style_name.get(sid, "").lower())
+            if m:
+                return int(m.group(1))
+            if sid in self.style_outline and self.style_outline[sid] < 9:
+                return self.style_outline[sid] + 1
+            sid = self.style_based.get(sid)
+        return None
+
+    def _num_kind(self, numpr) -> str | None:
+        if numpr is None:
+            return None
+        nid = numpr.find(W("numId"))
+        lv = numpr.find(W("ilvl"))
+        num_id = nid.get(W("val")) if nid is not None else None
+        if num_id in (None, "0"):
+            return None
+        fmt = self.abs_fmt.get((self.num_abs.get(num_id), lv.get(W("val")) if lv is not None else "0"), "bullet")
+        return "bullet" if fmt in ("bullet", "none") else "number"
 
     def _style_numpr(self, sid):
         seen = set()
@@ -210,6 +270,14 @@ class Context:
         pieces: list[Piece] = []
         self._inline(p, pieces, n)
         text = compose(pieces).strip()
+        level = self.heading_level_of(sid)
+        has_image = p.find(f".//{W('drawing')}") is not None or p.find(f".//{W('pict')}") is not None
+        abs_id = None
+        if numpr is not None:
+            nid = numpr.find(W("numId"))
+            abs_id = self.num_abs.get(nid.get(W("val"))) if nid is not None else None
+        self.para_meta.append({"n": n, "sid": sid or "Normal", "text": bool(text), "in_table": in_table,
+                               "list": self._num_kind(numpr), "abs": abs_id, "heading": level, "image": has_image})
         if in_table:
             return text
         if not text:
@@ -217,9 +285,10 @@ class Context:
         prefix = ""
         low = style.lower()
         m = re.match(r"heading (\d)", low)
-        if m:
-            prefix = "#" * int(m.group(1)) + " "
-            self.heading_level[n] = int(m.group(1))
+        if m or level:
+            lvl = int(m.group(1)) if m else level
+            prefix = "#" * lvl + " "
+            self.heading_level[n] = lvl
         elif low == "title":
             self.heading_level[n] = 0
             prefix = "# "
@@ -235,6 +304,8 @@ class Context:
     def _table(self, tbl, nested=False) -> list[list[str]]:
         if not nested:
             self.tables += 1
+            ts = tbl.find(f"{W('tblPr')}/{W('tblStyle')}")
+            self.table_styles.append(ts.get(W("val")) if ts is not None else "TableNormal")
         first = self.para + 1
         rows = []
         for tr in tbl.findall(W("tr")):
@@ -303,6 +374,10 @@ class Context:
 
     def _run(self, r, out: list, para: int, change: str, link: str):
         rpr = r.find(W("rPr"))
+        rs = rpr.find(W("rStyle")) if rpr is not None else None
+        if rs is not None:
+            cs = rs.get(W("val"))
+            self.char_styles[cs] = self.char_styles.get(cs, 0) + 1
         fmt = dict(bold=on(rpr, "b"), italic=on(rpr, "i"), strike=on(rpr, "strike") or on(rpr, "dstrike"),
                    change=change, link=link)
         for c in r:
@@ -497,6 +572,105 @@ class Context:
         if not data:
             raise IndexError(f"image {n} has no embedded data (linked picture?)")
         return meta, ctype, base64.b64decode(data)
+
+    # --- house style -----------------------------------------------------------------
+    def house_style(self) -> dict:
+        """Which style the document itself uses for each kind of content, so new content matches it.
+        Usage in the document wins; then styles the template defines but nobody used yet; then Word's
+        built-ins. Values: {"id": styleId, "name": style name, "source": "used" | "template" | "builtin"}."""
+        name = self.style_name
+
+        def pick(counter: dict, source="used"):
+            if not counter:
+                return None
+            sid = max(counter, key=counter.get)
+            return {"id": sid, "name": name.get(sid, sid), "source": source, "custom": sid in self.style_custom}
+
+        def count(pred):
+            c: dict[str, int] = {}
+            for m in self.para_meta:
+                if m["text"] and pred(m):
+                    c[m["sid"]] = c.get(m["sid"], 0) + 1
+            return c
+
+        def defined(pred, typ="paragraph"):
+            """Template styles (in styles.xml, custom) matching pred, by name."""
+            c = {sid: 1 for sid, t in self.style_type.items() if t == typ and sid in self.style_custom and pred(sid)}
+            return pick(c, "template") if len(c) else None
+
+        def builtin(n, sid):
+            return {"id": sid, "name": n, "source": "builtin", "custom": False}
+
+        role_name = lambda pat: (lambda sid: re.search(pat, name.get(sid, ""), re.I) is not None)  # noqa: E731
+        out: dict = {}
+        for lvl in range(1, 7):
+            out[f"heading{lvl}"] = (pick(count(lambda m, l=lvl: m["heading"] == l and not m["in_table"]))
+                                    or defined(lambda sid, l=lvl: self.heading_level_of(sid) == l)
+                                    or builtin(f"heading {lvl}", f"Heading{lvl}"))
+        out["title"] = (pick(count(lambda m: name.get(m["sid"], "").lower() == "title"))
+                        or builtin("Title", "Title"))
+        plain = lambda m: (not m["in_table"] and not m["heading"] and not m["list"] and not m["image"]  # noqa: E731
+                           and not re.search(r"caption|toc|title|quote|code|source|listing", name.get(m["sid"], ""), re.I))
+        used_body = count(plain)
+        out["body"] = (pick({k: v for k, v in used_body.items() if k != "Normal"})
+                       or defined(role_name(r"body"))
+                       or pick(used_body) or builtin("Normal", "Normal"))
+        for kind in ("bullet", "number"):
+            out[kind] = (pick(count(lambda m, k=kind: m["list"] == k and not m["in_table"]))
+                         or builtin("List Paragraph", "ListParagraph"))
+            abs_use: dict[str, int] = {}
+            for m in self.para_meta:
+                if m["list"] == kind and m["abs"] is not None:
+                    abs_use[m["abs"]] = abs_use.get(m["abs"], 0) + 1
+            if abs_use:  # the document's own bullets / numbering format, copied into new lists
+                out[kind]["abstract_xml"] = self.abstract_xml(max(abs_use, key=abs_use.get))
+        out["table"] = (pick({s: self.table_styles.count(s) for s in self.table_styles if s != "TableNormal"})
+                        or defined(lambda sid: True, "table") or builtin("Table Grid", "TableGrid"))
+        out["table_text"] = pick(count(lambda m: m["in_table"] and m["sid"] != "Normal"))
+        out["code"] = (pick(count(lambda m: role_name(r"code|source|listing|preformat|snippet")(m["sid"])))
+                       or defined(role_name(r"code|source|listing|preformat|snippet")))
+        code_chars = {s: c for s, c in self.char_styles.items() if role_name(r"code|mono|consol|source")(s)}
+        out["inline_code"] = pick(code_chars) or defined(role_name(r"code|mono|consol|source"), "character")
+        out["quote"] = (pick(count(lambda m: role_name(r"quote")(m["sid"])))
+                        or builtin("Quote", "Quote"))
+        out["caption"] = (pick(count(lambda m: role_name(r"caption")(m["sid"]))) or builtin("caption", "Caption"))
+        out["figure"] = pick({k: v for k, v in count(lambda m: m["image"] and not m["in_table"]).items() if k != "Normal"})
+        out["caption_label"] = max(self.seq_labels, key=self.seq_labels.get) if self.seq_labels else "Figure"
+        return {k: v for k, v in out.items() if v is not None}
+
+    def abstract_xml(self, abs_id: str) -> str | None:
+        nm = self.pkg.parts.get("/word/numbering.xml")
+        if nm is None:
+            return None
+        for a in nm.findall(W("abstractNum")):
+            if a.get(W("abstractNumId")) == abs_id:
+                return ET.tostring(a, encoding="unicode")
+        return None
+
+    def style_catalog(self) -> list[dict]:
+        """Styles defined in the document (not latent ones), with use counts and their look."""
+        uses: dict[str, int] = {}
+        for m in self.para_meta:
+            if m["text"]:
+                uses[m["sid"]] = uses.get(m["sid"], 0) + 1
+        for s in self.table_styles:
+            uses[s] = uses.get(s, 0) + 1
+        for s, c in self.char_styles.items():
+            uses[s] = uses.get(s, 0) + c
+        out = []
+        for sid, nm in self.style_name.items():
+            t = self.style_type.get(sid, "paragraph")
+            if t == "numbering" or (not uses.get(sid) and sid not in self.style_custom):
+                continue
+            item = {"name": nm, "type": t, "used": uses.get(sid, 0), "custom": sid in self.style_custom}
+            lvl = self.heading_level_of(sid)
+            if lvl:
+                item["heading_level"] = lvl
+            if sid in self.style_look:
+                item["look"] = self.style_look[sid]
+            out.append(item)
+        out.sort(key=lambda x: (-x["used"], x["name"]))
+        return out
 
     # --- output ------------------------------------------------------------------
     def render(self, start_paragraph: int = 1, max_chars: int = 60000) -> tuple[str, int | None]:

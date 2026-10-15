@@ -50,11 +50,20 @@ STYLES = """<w:styles %s>
 <w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:basedOn w:val="TableNormal"/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/></w:tblBorders></w:tblPr></w:style>
 </w:styles>""" % NS_DECL
 
+BUILTIN_IDS = set(re.findall(r'w:styleId="([^"]+)"', STYLES))
+
 BULLETS = [("", "Symbol"), ("o", "Courier New"), ("", "Wingdings")]
 NUMFMT = [("decimal", "%{}."), ("lowerLetter", "%{}."), ("lowerRoman", "%{}.")]
 
 
-def _numbering(lists: list[tuple[int, str]]) -> str:
+def _house_abstract(xml: str, abs_id: int) -> str:
+    """A list definition copied from the document, renumbered for the fragment. nsid/tmpl are dropped
+    so Word treats it as a new list (numbering restarts) with the same look."""
+    xml = re.sub(r'w:abstractNumId="[^"]*"', f'w:abstractNumId="{abs_id}"', xml, count=1)
+    return re.sub(r"<w:(nsid|tmpl)\b[^>]*/>", "", xml)
+
+
+def _numbering(lists: list[tuple[int, str]], house: dict | None = None) -> str:
     """One abstractNum per list kind, one num per list so every list restarts at 1."""
     lv_b, lv_n = [], []
     for i in range(9):
@@ -69,6 +78,11 @@ def _numbering(lists: list[tuple[int, str]]) -> str:
     out = [f'<w:numbering {NS_DECL}>',
            '<w:abstractNum w:abstractNumId="1"><w:multiLevelType w:val="hybridMultilevel"/>' + "".join(lv_b) + "</w:abstractNum>",
            '<w:abstractNum w:abstractNumId="2"><w:multiLevelType w:val="hybridMultilevel"/>' + "".join(lv_n) + "</w:abstractNum>"]
+    house = house or {}
+    for absid, kind in ((1, "bullet"), (2, "number")):
+        own = (house.get(kind) or {}).get("abstract_xml")
+        if own:
+            out[absid] = _house_abstract(own, absid)
     for num_id, kind in lists:
         absid = 1 if kind == "bullet" else 2
         out.append(f'<w:num w:numId="{num_id}"><w:abstractNumId w:val="{absid}"/>'
@@ -91,7 +105,9 @@ class Fragment:
 
 
 class Builder:
-    def __init__(self, base_dir: str, max_width_cm: float):
+    def __init__(self, base_dir: str, max_width_cm: float, house: dict | None = None):
+        self.house = house or {}
+        self.extra_styles: dict[str, tuple[str, str, bool]] = {}  # styleId -> (type, name, custom)
         self.base_dir = base_dir
         self.max_width_cm = max_width_cm
         self.body: list[str] = []
@@ -112,6 +128,20 @@ class Builder:
     def rid(self) -> str:
         self._rid += 1
         return f"rIdM{self._rid}"
+
+    def sid(self, role: str, default: str) -> str:
+        """Style id for a role: the document's house style when known, else the built-in default."""
+        h = self.house.get(role)
+        if not h:
+            return default
+        typ = {"table": "table", "inline_code": "character"}.get(role, "paragraph")
+        if h["id"] not in BUILTIN_IDS:
+            self.extra_styles[h["id"]] = (typ, h["name"], bool(h.get("custom", True)))
+        return h["id"]
+
+    def body_style(self) -> str:
+        s = self.sid("body", "")
+        return "" if s == "Normal" else s
 
     # --- images --------------------------------------------------------------------
     def load_image(self, src: str) -> tuple[bytes, str]:
@@ -205,7 +235,7 @@ class Builder:
     def text_run(self, text: str, fmt: dict) -> str:
         props = []
         if fmt.get("code"):
-            props.append('<w:rStyle w:val="InlineCode"/>')
+            props.append(f'<w:rStyle w:val="{self.sid("inline_code", "InlineCode")}"/>')
         elif fmt.get("link"):
             props.append('<w:rStyle w:val="Hyperlink"/>')
         if fmt.get("b"):
@@ -271,10 +301,11 @@ class Builder:
         self.paras += 1
 
     def caption(self, title: str) -> None:
-        runs = (self.text_run("Figure ", {}) +
-                '<w:fldSimple w:instr=" SEQ Figure \\* ARABIC "><w:r><w:rPr><w:noProof/></w:rPr><w:t>1</w:t></w:r></w:fldSimple>'
+        label = self.house.get("caption_label") or "Figure"
+        runs = (self.text_run(label + " ", {}) +
+                f'<w:fldSimple w:instr=" SEQ {label} \\* ARABIC "><w:r><w:rPr><w:noProof/></w:rPr><w:t>1</w:t></w:r></w:fldSimple>'
                 + self.text_run(": " + title, {}))
-        self.para(runs, "Caption", '<w:jc w:val="center"/>')  # under the centered image
+        self.para(runs, self.sid("caption", "Caption"), '<w:jc w:val="center"/>')  # under the centered image
         self.captions += 1
 
     def build(self, tokens) -> None:
@@ -287,7 +318,7 @@ class Builder:
             ty = t.type
             if ty == "heading_open":
                 level = int(t.tag[1])
-                self.para(self.inline(tokens[i + 1]), f"Heading{level}")
+                self.para(self.inline(tokens[i + 1]), self.sid(f"heading{level}", f"Heading{level}"))
                 self.headings += 1
                 i += 3
                 continue
@@ -330,27 +361,35 @@ class Builder:
                     lvl = len(list_stack) - 1
                     if item_first and item_first[-1]:
                         num = list_stack[-1]["num"]
-                        self.para(runs, "ListParagraph",
-                                  f'<w:numPr><w:ilvl w:val="{lvl}"/><w:numId w:val="{num}"/></w:numPr>')
+                        kind = list_stack[-1]["kind"]
+                        if lvl == 0 and (self.house.get(kind) or {}).get("style_numbering"):
+                            numpr = ""  # the chosen list style numbers itself
+                        else:
+                            numpr = f'<w:numPr><w:ilvl w:val="{lvl}"/><w:numId w:val="{num}"/></w:numPr>'
+                        self.para(runs, self.sid(kind, "ListParagraph"), numpr)
                         item_first[-1] = False
                     else:
-                        self.para(runs, "ListParagraph", f'<w:ind w:left="{720 * (lvl + 1)}"/>')
+                        # continuation paragraph of an item: same style, no number of its own
+                        self.para(runs, self.sid(list_stack[-1]["kind"], "ListParagraph"),
+                                  f'<w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr><w:ind w:left="{720 * (lvl + 1)}"/>')
                 elif quote:
-                    self.para(runs, "Quote")
+                    self.para(runs, self.sid("quote", "Quote"))
                 elif lone_image:
-                    self.para(runs, "", '<w:keepNext/><w:jc w:val="center"/>' if kids[0].attrGet("title") else '<w:jc w:val="center"/>')
+                    fig = self.sid("figure", "")  # the document's own picture paragraph style, if it has one
+                    keep = '<w:keepNext/>' if kids[0].attrGet("title") else ""
+                    self.para(runs, fig, keep + ("" if fig else '<w:jc w:val="center"/>'))
                     title = kids[0].attrGet("title")
                     if title:
                         self.caption(title)
                 else:
-                    self.para(runs)
+                    self.para(runs, self.body_style())
                 i += 3
                 continue
             if ty in ("fence", "code_block"):
                 lines = t.content.rstrip("\n").split("\n")
                 for k, line in enumerate(lines):
                     keep = '<w:keepNext/>' if k < len(lines) - 1 else '<w:spacing w:after="160"/>'
-                    self.para(self.text_run(line, {}) if line else "", "Code", keep)
+                    self.para(self.text_run(line, {}) if line else "", self.sid("code", "Code"), keep)
                 i += 1
                 continue
             if ty == "table_open":
@@ -388,7 +427,11 @@ class Builder:
                             "align": {"center": "center", "right": "right"}.get(m.group(1) if m else "", "")})
             i += 1
         cols = max(len(r) for r in rows) if rows else 0
-        xml = ['<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="5000" w:type="pct"/>'
+        tstyle = self.sid("table", "TableGrid")
+        own_table = tstyle != "TableGrid"   # a house table style formats its own header row
+        cell_style = self.sid("table_text", "")
+        cell_ppr = f'<w:pStyle w:val="{cell_style}"/>' if cell_style and cell_style != "Normal" else ""
+        xml = [f'<w:tbl><w:tblPr><w:tblStyle w:val="{tstyle}"/><w:tblW w:w="5000" w:type="pct"/>'
                '<w:tblLook w:val="04A0" w:firstRow="1" w:lastRow="0" w:firstColumn="1" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/>'
                '</w:tblPr><w:tblGrid>' + "".join('<w:gridCol/>' for _ in range(cols)) + "</w:tblGrid>"]
         for r_i, row in enumerate(rows):
@@ -397,11 +440,11 @@ class Builder:
             for c_i in range(cols):
                 cell = row[c_i] if c_i < len(row) else {"runs": "", "head": False, "align": ""}
                 runs = cell["runs"]
-                if cell["head"]:
+                if cell["head"] and not own_table:
                     runs = runs.replace("<w:r><w:rPr>", "<w:r><w:rPr><w:b/>").replace("<w:r><w:t", "<w:r><w:rPr><w:b/></w:rPr><w:t")
-                shade = '<w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/>' if cell["head"] else ""
+                shade = '<w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/>' if cell["head"] and not own_table else ""
                 jc = f'<w:jc w:val="{cell["align"]}"/>' if cell["align"] else ""
-                xml.append(f'<w:tc><w:tcPr>{shade}</w:tcPr><w:p><w:pPr><w:spacing w:after="0"/>{jc}</w:pPr>{runs}</w:p></w:tc>')
+                xml.append(f'<w:tc><w:tcPr>{shade}</w:tcPr><w:p><w:pPr>{cell_ppr}{'' if cell_ppr else '<w:spacing w:after="0"/>'}{jc}</w:pPr>{runs}</w:p></w:tc>')
                 self.paras += 1
             xml.append("</w:tr>")
             self.paras += 1  # end-of-row mark
@@ -411,6 +454,18 @@ class Builder:
         return i + 1
 
     # --- package ------------------------------------------------------------------
+    def styles_xml(self) -> str:
+        """Fallback definitions for built-ins, plus name-only entries for the document's own
+        (house) styles: Word then applies the document's definition, never a copy."""
+        # customStyle only for the document's own styles: on a built-in (e.g. "Body Text") it would make
+        # Word create a duplicate ("Body Text1")
+        custom_attr = ' w:customStyle="1"'
+        extra = "".join(
+            f'<w:style w:type="{typ}"{custom_attr if custom else ""} w:styleId={quoteattr(sid)}>'
+            f'<w:name w:val={quoteattr(name)}/></w:style>'
+            for sid, (typ, name, custom) in self.extra_styles.items())
+        return STYLES.replace("</w:styles>", extra + "</w:styles>")
+
     def package(self) -> str:
         rels = ['<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>']
         if self.lists:
@@ -427,11 +482,11 @@ class Builder:
             '<pkg:part pkg:name="/word/document.xml" pkg:contentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml">'
             f'<pkg:xmlData><w:document {NS_DECL}><w:body>' + "".join(self.body) + "</w:body></w:document></pkg:xmlData></pkg:part>",
             '<pkg:part pkg:name="/word/styles.xml" pkg:contentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml">'
-            f"<pkg:xmlData>{STYLES}</pkg:xmlData></pkg:part>",
+            f"<pkg:xmlData>{self.styles_xml()}</pkg:xmlData></pkg:part>",
         ]
         if self.lists:
             parts.append('<pkg:part pkg:name="/word/numbering.xml" pkg:contentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml">'
-                         f"<pkg:xmlData>{_numbering(self.lists)}</pkg:xmlData></pkg:part>")
+                         f"<pkg:xmlData>{_numbering(self.lists, self.house)}</pkg:xmlData></pkg:part>")
         for name, ctype, data in self.media:
             parts.append(f'<pkg:part pkg:name="{name}" pkg:contentType="{ctype}" pkg:compression="store">'
                          f"<pkg:binaryData>{base64.b64encode(data).decode()}</pkg:binaryData></pkg:part>")
@@ -442,8 +497,9 @@ class Builder:
 _WIDTH = re.compile(r"(!\[[^\]]*\]\([^)]*\))\{\s*width\s*=\s*([0-9.]+)\s*(cm|%)\s*\}")
 
 
-def build(markdown: str, base_dir: str = ".", max_width_cm: float = 16.0) -> Fragment:
-    """Markdown -> flat-OPC XML for Range.InsertXML."""
+def build(markdown: str, base_dir: str = ".", max_width_cm: float = 16.0, house: dict | None = None) -> Fragment:
+    """Markdown -> flat-OPC XML for Range.InsertXML. `house` (docx_context.Context.house_style()) makes
+    every element use the document's own styles and list definitions."""
     widths: list = []
     # one slot per image (None = no hint) so each {width=...} lines up with its own image
     md_text = markdown.replace("\r\n", "\n")
@@ -462,7 +518,7 @@ def build(markdown: str, base_dir: str = ".", max_width_cm: float = 16.0) -> Fra
     md_text = "".join(out)
 
     md = MarkdownIt("commonmark", {"html": False}).enable("table").enable("strikethrough")
-    b = Builder(base_dir, max_width_cm)
+    b = Builder(base_dir, max_width_cm, house)
     b.widths = widths
     b.build(md.parse(md_text))
     return Fragment(b.package(), b.paras, b.headings, b.tables, b.images, b.svg, b.captions, b.warnings)
