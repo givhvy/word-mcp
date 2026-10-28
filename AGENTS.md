@@ -13,6 +13,9 @@ engineering tool is required:
   model, WordOpenXML, how `Range.InsertXML` resolves styles and lists, the COM error codes, Word's
   surprising behaviours, the server's architecture and invariants, and a symptom -> cause -> fix playbook.
 
+- [skills/m8-word-docs/SKILL.md](skills/m8-word-docs/SKILL.md): how to do Mission 8 Word document work
+  (review comments, integration overview) with correct, verified content.
+
 Rules:
 
 - **Never test on a user's real document.** Reproduce with a disposable document
