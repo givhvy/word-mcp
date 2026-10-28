@@ -26,37 +26,77 @@ agent edit is a single Ctrl+Z step.
 
 ## Install
 
+### 1. Get the code and install dependencies
+
+A virtual environment keeps the dependencies away from your other Python projects, and gives the
+MCP client one fixed `python.exe` to launch.
+
 ```powershell
 git clone https://github.com/givhvy/word-mcp.git
 cd word-mcp
-python -m pip install -r requirements.txt
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Check Python can reach Word (prints its version, changes nothing):
+Check Python can reach Word (prints its version, changes nothing). Word must be installed; it does
+not need to be open.
 
 ```powershell
-python -c "import win32com.client as c; print('Word', c.Dispatch('Word.Application').Version)"
+.\.venv\Scripts\python.exe -c "import win32com.client as c; print('Word', c.Dispatch('Word.Application').Version)"
 ```
 
-### Register with your agent
+### 2. Register it with your agent
 
-Use the **full path** to `word_mcp_server.py`. The `-I` flag runs Python isolated from the current directory.
+Rules that apply to every client:
+
+- The command is the **full path to the venv's `python.exe`**, followed by the **full path to
+  `word_mcp_server.py`**. Relative paths break because the client starts the server from its own
+  working directory.
+- The server talks over stdio. Do not run it by hand to "start" it: the client launches it.
+- Below, replace `C:\path\to\word-mcp` with the folder you cloned into.
+- The default name is **`word-huy`**. It is the key in each config below (and the name after `claude mcp add`).
+  You can use any other name. The name only sets the tool prefix, for example `mcp__word-huy__...` in Claude Code
+  or `word-huy_...` in OpenCode. If you rename it, use your name wherever this README says `word-huy`.
+- The `-I` flag runs Python isolated from the current directory. It is optional but recommended.
 
 **Claude Code**
 
 ```powershell
-claude mcp add word --scope user -- python -I C:\path\to\word-mcp\word_mcp_server.py
+claude mcp add word-huy --scope user -- C:\path\to\word-mcp\.venv\Scripts\python.exe -I C:\path\to\word-mcp\word_mcp_server.py
 ```
 
-Restart Claude Code. The tools appear as `mcp__word__word_context`, `mcp__word__word_insert`, and so on.
+Restart Claude Code. The tools appear as `mcp__word-huy__word_context`, `mcp__word-huy__word_insert`, and so on.
+
+**OpenCode** (`~/.config/opencode/opencode.json`, or `opencode.json` in a project)
+
+Add the server under `mcp`. Keep any entries already there.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "word-huy": {
+      "type": "local",
+      "command": [
+        "C:\\path\\to\\word-mcp\\.venv\\Scripts\\python.exe",
+        "-I",
+        "C:\\path\\to\\word-mcp\\word_mcp_server.py"
+      ]
+    }
+  }
+}
+```
+
+Restart OpenCode. The tools are named `word-huy_<tool>` (for example `word-huy_word_context`). To skip the
+permission prompt for them, add `"word-huy_*": "allow"` under `permission`.
 
 **Claude Desktop, Cursor, Windsurf, Cline, or any MCP client using JSON config**
 
 ```json
 {
   "mcpServers": {
-    "word": {
-      "command": "python",
+    "word-huy": {
+      "command": "C:\\path\\to\\word-mcp\\.venv\\Scripts\\python.exe",
       "args": ["-I", "C:\\path\\to\\word-mcp\\word_mcp_server.py"]
     }
   }
@@ -66,19 +106,37 @@ Restart Claude Code. The tools appear as `mcp__word__word_context`, `mcp__word__
 **Codex CLI** (`~/.codex/config.toml`)
 
 ```toml
-[mcp_servers.word]
-command = "python"
+[mcp_servers.word-huy]
+command = "C:\\path\\to\\word-mcp\\.venv\\Scripts\\python.exe"
 args = ["-I", "C:\\path\\to\\word-mcp\\word_mcp_server.py"]
 ```
 
-If `python` is not on PATH for your client, use the full path to `python.exe`.
+If you skipped the venv, use `python` as the command, provided `python` on the client's PATH is the
+one you installed the requirements into.
+
+JSON and TOML need doubled backslashes (`\\`) in Windows paths, or forward slashes (`C:/path/...`).
+
+### 3. Check that it works
+
+1. Open Word and a throwaway document.
+2. Restart your MCP client so it starts the server.
+3. Ask the agent: *"Call word_status and tell me what it returns."* It should report your Word version
+   and the open document.
+
+If the client shows the server as failed or missing, see [Troubleshooting](#troubleshooting). Set
+`WORD_MCP_LOG` (below) to get the full error trace.
+
+### Remove
+
+Delete the `word-huy` entry from the client's config (Claude Code: `claude mcp remove word-huy`), restart the
+client, and delete the cloned folder.
 
 ### Update
 
 ```powershell
 cd word-mcp
 git pull
-python -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 Then restart your MCP client (Claude Code, Cursor, OpenCode, ...) so it starts the new server.
@@ -90,13 +148,13 @@ file when reporting an issue.
 ### Verify (optional)
 
 ```powershell
-python -I test_word_mcp.py
-python -I test_context.py
-python -I test_v2.py
-python -I test_styles.py
-python -I test_anchors.py           # anchors, numbering and deletes on a section-break / table-heavy document
-python -I test_tables.py            # table insert placement and every word_table_edit action
-python -I test_concurrent_user.py   # needs cua-driver: simulates a user paging through the document
+.\.venv\Scripts\python.exe -I test_word_mcp.py
+.\.venv\Scripts\python.exe -I test_context.py
+.\.venv\Scripts\python.exe -I test_v2.py
+.\.venv\Scripts\python.exe -I test_styles.py
+.\.venv\Scripts\python.exe -I test_anchors.py           # anchors, numbering and deletes on a section-break / table-heavy document
+.\.venv\Scripts\python.exe -I test_tables.py            # table insert placement and every word_table_edit action
+.\.venv\Scripts\python.exe -I test_concurrent_user.py   # needs cua-driver: simulates a user paging through the document
 ```
 
 Each test creates its own scratch documents in your open Word, checks every tool, and closes only what

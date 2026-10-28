@@ -1,12 +1,12 @@
 ---
 name: m8-word-docs
-description: How to edit M8 Word documents (review comments, integration overview, design docs) with the word-new MCP so the content is correct, minimal and verified. Use for any Word task in the Mission 8 workspace.
+description: How to edit M8 Word documents (review comments, integration overview, design docs) with the word-huy MCP so the content is correct, minimal and verified. Use for any Word task in the Mission 8 workspace.
 ---
 
 # M8 Word document work
 
 ## Rules
-- Use only the `word-new` MCP. Never the old `word` MCP.
+- Use only the `word-huy` MCP (this repo; tools appear as `word-huy_*`, or whatever name it was registered under). Never the old `word` MCP from `word-document-mcp`.
 - Edit the open document in place. Do not rename it (SharePoint). Do not save, resolve comments or reply to comments unless the user says so.
 - Keep the user's wording when they ask for it. Change only what the comment asks for.
 - Keep text short and non-technical. Do not apply the unslop skill to document text.

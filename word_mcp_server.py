@@ -175,7 +175,7 @@ class ComWorker:
 
 
 worker = ComWorker()
-mcp = FastMCP("word", log_level="WARNING", instructions=(
+mcp = FastMCP("word-huy", log_level="WARNING", instructions=(
     "Works live inside the Microsoft Word open on this PC (local files and SharePoint/OneDrive documents "
     "opened in Word desktop); edits appear instantly in the user's window.\n"
     "Workflow: 1) word_context reads the whole live document (text, structure, images, comments, the user's "
